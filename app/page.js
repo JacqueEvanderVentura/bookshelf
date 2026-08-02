@@ -1013,11 +1013,176 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
   const [fontSize, setFontSize] = useState(loadLS(STORAGE_KEYS.SETTINGS, {})?.fontSize || 20)
   const [readingAloud, setReadingAloud] = useState(false)
   const [speakingWord, setSpeakingWord] = useState(null)
+  const [phraseSel, setPhraseSel] = useState(null) // { pA, wA, pF, wF }
   const scrollRef = useRef(null)
   const barRef = useRef(null)
   const percentTextRef = useRef(null)
+  const longPressTimerRef = useRef(null)
+  const pointerStartRef = useRef(null)
   const chapter = book.chapters[chapterIdx] || book.chapters[0]
   const hasMultipleChapters = book.chapters.length > 1
+
+  // Cleanup long-press timer on unmount / chapter change
+  useEffect(() => () => { if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current) }, [])
+
+  const normalizedRange = useMemo(() => {
+    if (!phraseSel) return null
+    const { pA, wA, pF, wF } = phraseSel
+    if (pF < pA || (pF === pA && wF < wA)) return { pMin: pF, wMin: wF, pMax: pA, wMax: wA }
+    return { pMin: pA, wMin: wA, pMax: pF, wMax: wF }
+  }, [phraseSel])
+
+  const finalizePhrase = useCallback(() => {
+    if (!phraseSel) return
+    const range = (() => {
+      const { pA, wA, pF, wF } = phraseSel
+      if (pF < pA || (pF === pA && wF < wA)) return { pMin: pF, wMin: wF, pMax: pA, wMax: wA }
+      return { pMin: pA, wMin: wA, pMax: pF, wMax: wF }
+    })()
+    // Build phrase text from range
+    const { pMin, wMin, pMax, wMax } = range
+    const outParts = []
+    for (let p = pMin; p <= pMax; p++) {
+      const tokens = tokenize(chapter.paragraphs[p])
+      let wi = 0
+      let text = ''
+      let started = false
+      let ended = false
+      for (const t of tokens) {
+        if (t.type === 'word') {
+          const inRange =
+            (p === pMin && p === pMax && wi >= wMin && wi <= wMax) ||
+            (p === pMin && p !== pMax && wi >= wMin) ||
+            (p > pMin && p < pMax) ||
+            (p === pMax && p !== pMin && wi <= wMax)
+          if (inRange) {
+            text += t.text
+            started = true
+          } else if (started) {
+            // Once we pass the last in-range word for this paragraph, stop
+            ended = true
+          }
+          wi++
+        } else if (started && !ended) {
+          text += t.text
+        }
+      }
+      // Trim trailing punctuation/spaces
+      outParts.push(text.replace(/[\s,;:.\-—–]+$/u, '').trim())
+    }
+    const phrase = outParts.filter(Boolean).join(' ')
+    setPhraseSel(null)
+    // Restore scroll
+    if (scrollRef.current) scrollRef.current.style.touchAction = ''
+    // Trigger panel
+    if (phrase && phrase.length > 0) {
+      const context = chapter.paragraphs.slice(pMin, pMax + 1).join(' ')
+      onSelectWord({
+        word: phrase,
+        isPhrase: phrase.trim().split(/\s+/).length > 1,
+        context,
+        bookId: book.id,
+        bookTitle: book.title,
+        chapterIdx,
+        paraIdx: pMin,
+        wordIdx: wMin,
+      })
+    }
+  }, [phraseSel, chapter, book, chapterIdx, onSelectWord])
+
+  const cancelSelection = useCallback(() => {
+    if (longPressTimerRef.current) { clearTimeout(longPressTimerRef.current); longPressTimerRef.current = null }
+    pointerStartRef.current = null
+    setPhraseSel(null)
+    if (scrollRef.current) scrollRef.current.style.touchAction = ''
+  }, [])
+
+  // Pointer handlers on the article
+  const handlePointerDown = useCallback((e) => {
+    // Only left button / touch
+    if (e.button !== undefined && e.button !== 0) return
+    const wordEl = e.target.closest?.('[data-p][data-w]')
+    if (!wordEl) return
+    const p = parseInt(wordEl.dataset.p, 10)
+    const w = parseInt(wordEl.dataset.w, 10)
+    pointerStartRef.current = { x: e.clientX, y: e.clientY, p, w, pointerId: e.pointerId }
+    if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current)
+    longPressTimerRef.current = setTimeout(() => {
+      longPressTimerRef.current = null
+      setPhraseSel({ pA: p, wA: w, pF: p, wF: w })
+      // Disable scroll during selection
+      if (scrollRef.current) scrollRef.current.style.touchAction = 'none'
+      // Haptic feedback if available
+      if (typeof navigator !== 'undefined' && navigator.vibrate) navigator.vibrate(15)
+      // Capture pointer so future move events land on this element
+      try { wordEl.setPointerCapture?.(pointerStartRef.current.pointerId) } catch {}
+    }, 380)
+  }, [])
+
+  const handlePointerMove = useCallback((e) => {
+    // If timer still pending and finger moved > 10px, treat as scroll → cancel long press
+    if (longPressTimerRef.current && pointerStartRef.current) {
+      const dx = e.clientX - pointerStartRef.current.x
+      const dy = e.clientY - pointerStartRef.current.y
+      if (Math.hypot(dx, dy) > 10) {
+        clearTimeout(longPressTimerRef.current)
+        longPressTimerRef.current = null
+      }
+    }
+    // Track drag during selection
+    if (phraseSel) {
+      e.preventDefault?.()
+      const el = document.elementFromPoint(e.clientX, e.clientY)
+      const wordEl = el?.closest?.('[data-p][data-w]')
+      if (wordEl) {
+        const pF = parseInt(wordEl.dataset.p, 10)
+        const wF = parseInt(wordEl.dataset.w, 10)
+        if (pF !== phraseSel.pF || wF !== phraseSel.wF) {
+          setPhraseSel(prev => ({ ...prev, pF, wF }))
+        }
+      }
+    }
+  }, [phraseSel])
+
+  const handlePointerUp = useCallback((e) => {
+    const wasSelecting = !!phraseSel
+    const timerWasPending = !!longPressTimerRef.current
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current)
+      longPressTimerRef.current = null
+    }
+    if (wasSelecting) {
+      finalizePhrase()
+    } else if (timerWasPending && pointerStartRef.current) {
+      // Short tap on a word — trigger single-word define
+      const start = pointerStartRef.current
+      const dx = e.clientX - start.x
+      const dy = e.clientY - start.y
+      if (Math.hypot(dx, dy) < 10) {
+        const paraText = chapter.paragraphs[start.p]
+        const tokens = tokenize(paraText)
+        let wi = 0
+        for (const t of tokens) {
+          if (t.type === 'word') {
+            if (wi === start.w) {
+              onSelectWord({
+                word: t.text,
+                context: paraText,
+                bookId: book.id,
+                bookTitle: book.title,
+                chapterIdx,
+                paraIdx: start.p,
+                wordIdx: start.w,
+              })
+              break
+            }
+            wi++
+          }
+        }
+      }
+    }
+    pointerStartRef.current = null
+  }, [phraseSel, finalizePhrase, chapter, book, chapterIdx, onSelectWord])
 
   const goToChapter = useCallback((newIdx) => {
     if (newIdx < 0 || newIdx >= book.chapters.length) return
@@ -1139,18 +1304,6 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
 
   const initialPercent = progress?.percent || 0
 
-  const handleWordTap = (word, paraIdx, wordIdx, paraText) => {
-    onSelectWord({
-      word,
-      context: paraText,
-      bookId: book.id,
-      bookTitle: book.title,
-      chapterIdx,
-      paraIdx,
-      wordIdx,
-    })
-  }
-
   const changeFontSize = (delta) => {
     const s = Math.max(15, Math.min(28, fontSize + delta))
     setFontSize(s)
@@ -1199,7 +1352,13 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
       </header>
 
       <div ref={scrollRef} className="flex-1 overflow-y-auto safe-bottom">
-        <article className="max-w-2xl mx-auto px-6 py-8 pb-32">
+        <article
+          className="max-w-2xl mx-auto px-6 py-8 pb-32 select-none"
+          onPointerDown={handlePointerDown}
+          onPointerMove={handlePointerMove}
+          onPointerUp={handlePointerUp}
+          onPointerCancel={cancelSelection}
+        >
           <header className="mb-8 text-center">
             <div className="text-[11px] uppercase tracking-widest text-muted-foreground/80">{book.author}</div>
             <h2 className="font-serif-cozy text-2xl font-semibold mt-1 leading-tight">{chapter.title}</h2>
@@ -1212,9 +1371,10 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
                 key={pIdx}
                 text={para}
                 paraIdx={pIdx}
-                onWordTap={(w, wIdx) => handleWordTap(w, pIdx, wIdx, para)}
                 speakingWord={speakingWord}
                 bookmarkedWords={bookmarkedWords}
+                range={normalizedRange}
+                selecting={!!phraseSel}
               />
             ))}
           </div>
@@ -1259,25 +1419,47 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
   )
 }
 
-function Paragraph({ text, paraIdx, onWordTap, speakingWord, bookmarkedWords }) {
+function Paragraph({ text, paraIdx, speakingWord, bookmarkedWords, range, selecting }) {
   const tokens = useMemo(() => tokenize(text), [text])
+
+  const isInRange = (wIdx) => {
+    if (!range) return false
+    const { pMin, wMin, pMax, wMax } = range
+    if (paraIdx < pMin || paraIdx > pMax) return false
+    if (paraIdx === pMin && paraIdx === pMax) return wIdx >= wMin && wIdx <= wMax
+    if (paraIdx === pMin) return wIdx >= wMin
+    if (paraIdx === pMax) return wIdx <= wMax
+    return true
+  }
+
   let wIdx = -1
   return (
     <p className="text-foreground/90">
       {tokens.map((t, i) => {
-        if (t.type === 'space') return <span key={i}>{t.text}</span>
+        if (t.type === 'space') {
+          // If between two selected words, highlight the space too for continuity
+          const prev = tokens[i - 1]
+          const next = tokens[i + 1]
+          const spaceInRange = selecting && prev?.type === 'word' && next?.type === 'word' &&
+            isInRange(wIdx) && isInRange(wIdx + 1)
+          return (
+            <span key={i} className={spaceInRange ? 'phrase-selected' : undefined}>
+              {t.text}
+            </span>
+          )
+        }
         wIdx++
         const currentWIdx = wIdx
         const isSpeaking = speakingWord?.paraIdx === paraIdx && speakingWord?.wordIdx === currentWIdx
         const isBookmarked = bookmarkedWords.has(t.text.toLowerCase())
+        const inRange = isInRange(currentWIdx)
         return (
           <span
             key={i}
             data-p={paraIdx}
             data-w={currentWIdx}
-            className={`word ${isSpeaking ? 'word-speaking' : ''} ${isBookmarked ? 'font-medium' : ''}`}
-            onClick={() => onWordTap(t.text, currentWIdx)}
-            style={isBookmarked ? { textDecoration: 'underline', textDecorationColor: 'hsl(28 51% 65% / 0.55)', textDecorationThickness: '2px', textUnderlineOffset: '3px' } : undefined}
+            className={`word ${isSpeaking ? 'word-speaking' : ''} ${inRange ? 'phrase-selected' : ''} ${isBookmarked ? 'font-medium' : ''}`}
+            style={isBookmarked && !inRange ? { textDecoration: 'underline', textDecorationColor: 'hsl(28 51% 65% / 0.55)', textDecorationThickness: '2px', textUnderlineOffset: '3px' } : undefined}
           >
             {t.text}
           </span>
@@ -1298,14 +1480,15 @@ function DefinitionPanel({ selection, onClose, cache, onCache, onBookmark, bookm
 
   const word = selection?.word
   const wordLower = word?.toLowerCase()
+  const isPhraseMode = !!selection?.isPhrase || (word && word.trim().includes(' '))
+  const cacheKey = isPhraseMode ? `p::${wordLower}` : wordLower
   const isBookmarked = !!bookmarks.find(b => b.word === wordLower && b.bookId === selection?.bookId)
 
   useEffect(() => {
     if (!selection) { setDef(null); setError(null); return }
-    const lower = word.toLowerCase()
 
-    if (cache[lower]) {
-      setDef(cache[lower])
+    if (cache[cacheKey]) {
+      setDef(cache[cacheKey])
       setError(null)
       return
     }
@@ -1314,10 +1497,15 @@ function DefinitionPanel({ selection, onClose, cache, onCache, onBookmark, bookm
     setError(null)
     setDef(null)
 
-    fetch('/api/define', {
+    const url = isPhraseMode ? '/api/explain' : '/api/define'
+    const body = isPhraseMode
+      ? { phrase: word, context: selection.context?.slice(0, 600) || '' }
+      : { word: wordLower, context: selection.context?.slice(0, 400) || '' }
+
+    fetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ word: lower, context: selection.context?.slice(0, 400) || '' }),
+      body: JSON.stringify(body),
     })
       .then(async (r) => {
         if (!r.ok) throw new Error('Lookup failed')
@@ -1325,12 +1513,16 @@ function DefinitionPanel({ selection, onClose, cache, onCache, onBookmark, bookm
       })
       .then((data) => {
         setDef(data)
-        onCache(lower, data)
+        onCache(cacheKey, data)
       })
       .catch(() => {
-        const fb = FALLBACK_DEFS[lower]
-        if (fb) { setDef({ word: lower, ...fb }); setError(null) }
-        else setError('Could not fetch definition. Check your connection.')
+        if (!isPhraseMode) {
+          const fb = FALLBACK_DEFS[wordLower]
+          if (fb) { setDef({ word: wordLower, ...fb }); setError(null); return }
+        }
+        setError(isPhraseMode
+          ? 'Could not explain the phrase. Check your connection.'
+          : 'Could not fetch definition. Check your connection.')
       })
       .finally(() => setLoading(false))
   }, [selection]) // eslint-disable-line
@@ -1354,31 +1546,38 @@ function DefinitionPanel({ selection, onClose, cache, onCache, onBookmark, bookm
       const r = await fetch('/api/more-examples', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ word: wordLower, have: def.examples || [], context: selection?.context || '' }),
+        body: JSON.stringify({ word: word, have: def.examples || [], context: selection?.context || '' }),
       })
       const data = await r.json()
       if (data.examples?.length) {
         const updated = { ...def, examples: [...(def.examples || []), ...data.examples] }
         setDef(updated)
-        onCache(wordLower, updated)
+        onCache(cacheKey, updated)
       }
     } catch { toast.error('Could not load more examples') }
     setLoadingMore(false)
-  }, [def, loadingMore, wordLower, selection, onCache])
+  }, [def, loadingMore, word, selection, onCache, cacheKey])
 
   const handleBookmark = () => {
     if (!def) return
     onBookmark({
       word: wordLower,
-      definition: def.definition,
-      phonetic: def.phonetic,
-      partOfSpeech: def.partOfSpeech,
+      definition: isPhraseMode ? def.meaning : def.definition,
+      phonetic: def.phonetic || null,
+      partOfSpeech: isPhraseMode ? def.type : def.partOfSpeech,
       examples: def.examples,
+      literal: def.literal || null,
+      isPhrase: isPhraseMode,
       context: selection.context,
       bookId: selection.bookId,
       bookTitle: selection.bookTitle,
     })
   }
+
+  // Display strings
+  const displayText = word || ''
+  const meaning = def ? (isPhraseMode ? def.meaning : def.definition) : null
+  const typeLabel = def ? (isPhraseMode ? def.type : def.partOfSpeech) : null
 
   return (
     <AnimatePresence>
@@ -1406,25 +1605,27 @@ function DefinitionPanel({ selection, onClose, cache, onCache, onBookmark, bookm
 
             <div className="px-6 pt-3 pb-2 flex items-start justify-between gap-3">
               <div className="flex-1 min-w-0">
-                <div className="flex items-center gap-2 flex-wrap">
-                  <h3 className="font-serif-cozy text-3xl font-semibold capitalize leading-tight">{word}</h3>
+                <div className="flex items-start gap-2 flex-wrap">
+                  <h3 className={`font-serif-cozy font-semibold leading-tight ${isPhraseMode ? 'text-xl' : 'text-3xl capitalize'}`}>
+                    {isPhraseMode ? `“${displayText}”` : displayText}
+                  </h3>
                   <Button
                     variant="ghost" size="icon"
-                    className="h-9 w-9 rounded-full hover:bg-primary/20"
-                    onClick={() => speak(word)}
-                    aria-label="Pronounce word"
+                    className="h-9 w-9 rounded-full hover:bg-primary/20 flex-shrink-0 -mt-0.5"
+                    onClick={() => speak(displayText)}
+                    aria-label={isPhraseMode ? 'Read phrase' : 'Pronounce word'}
                   >
                     <Volume2 className="w-4 h-4 text-secondary" />
                   </Button>
                 </div>
                 {def && (
-                  <div className="text-sm text-muted-foreground mt-0.5 flex items-center gap-2 flex-wrap">
+                  <div className="text-sm text-muted-foreground mt-1 flex items-center gap-2 flex-wrap">
                     {def.phonetic && <span className="font-mono">{def.phonetic}</span>}
-                    {def.partOfSpeech && <span className="italic">· {def.partOfSpeech}</span>}
+                    {typeLabel && <span className="italic">{def.phonetic ? '· ' : ''}{typeLabel}</span>}
                   </div>
                 )}
               </div>
-              <div className="flex items-center gap-1">
+              <div className="flex items-center gap-1 flex-shrink-0">
                 <Button
                   variant="ghost" size="icon"
                   className="h-10 w-10 rounded-full hover:bg-primary/20"
@@ -1446,7 +1647,9 @@ function DefinitionPanel({ selection, onClose, cache, onCache, onBookmark, bookm
               {loading && (
                 <div className="py-10 grid place-items-center text-muted-foreground">
                   <Loader2 className="w-6 h-6 animate-spin text-primary" />
-                  <p className="mt-3 font-serif-cozy italic text-sm">Looking it up...</p>
+                  <p className="mt-3 font-serif-cozy italic text-sm">
+                    {isPhraseMode ? 'Thinking about this phrase...' : 'Looking it up...'}
+                  </p>
                 </div>
               )}
 
@@ -1459,8 +1662,16 @@ function DefinitionPanel({ selection, onClose, cache, onCache, onBookmark, bookm
               {def && !loading && (
                 <div className="space-y-5">
                   <div className="paper-texture rounded-2xl px-5 py-4 border border-border/40">
-                    <div className="text-[11px] font-medium uppercase tracking-widest text-muted-foreground/80 mb-1.5">Meaning</div>
-                    <p className="text-foreground leading-relaxed">{def.definition}</p>
+                    <div className="text-[11px] font-medium uppercase tracking-widest text-muted-foreground/80 mb-1.5">
+                      {isPhraseMode ? 'What it means' : 'Meaning'}
+                    </div>
+                    <p className="text-foreground leading-relaxed">{meaning}</p>
+                    {isPhraseMode && def.literal && (
+                      <div className="mt-3 pt-3 border-t border-border/40">
+                        <div className="text-[11px] font-medium uppercase tracking-widest text-muted-foreground/80 mb-1">Literally</div>
+                        <p className="text-sm text-foreground/80 leading-relaxed italic">{def.literal}</p>
+                      </div>
+                    )}
                   </div>
 
                   <div>
@@ -1557,21 +1768,27 @@ function BookmarkCard({ bookmark, onRemove, onOpen }) {
     window.speechSynthesis.speak(u)
   }
   const date = new Date(bookmark.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
+  const isPhrase = !!bookmark.isPhrase
   return (
     <Card className="paper-texture border border-border/60 rounded-2xl p-4 shadow-sm">
       <div className="flex items-start justify-between gap-3">
         <div className="flex-1 min-w-0">
-          <div className="flex items-center gap-2 flex-wrap">
-            <h3 className="font-serif-cozy text-2xl font-semibold capitalize leading-none">{bookmark.word}</h3>
-            <Button variant="ghost" size="icon" onClick={speak} className="h-7 w-7 rounded-full hover:bg-primary/15">
+          <div className="flex items-start gap-2 flex-wrap">
+            <h3 className={`font-serif-cozy font-semibold leading-tight ${isPhrase ? 'text-lg' : 'text-2xl capitalize'}`}>
+              {isPhrase ? `“${bookmark.word}”` : bookmark.word}
+            </h3>
+            <Button variant="ghost" size="icon" onClick={speak} className="h-7 w-7 rounded-full hover:bg-primary/15 flex-shrink-0 mt-0.5">
               <Volume2 className="w-3.5 h-3.5 text-secondary" />
             </Button>
           </div>
           <div className="text-xs text-muted-foreground mt-1.5 flex items-center gap-2 flex-wrap">
             {bookmark.phonetic && <span className="font-mono">{bookmark.phonetic}</span>}
-            {bookmark.partOfSpeech && <span className="italic">· {bookmark.partOfSpeech}</span>}
+            {bookmark.partOfSpeech && <span className="italic">{bookmark.phonetic ? '· ' : ''}{bookmark.partOfSpeech}</span>}
           </div>
           <p className="text-sm mt-2.5 text-foreground/85 leading-relaxed">{bookmark.definition}</p>
+          {isPhrase && bookmark.literal && (
+            <p className="text-xs mt-1.5 text-muted-foreground italic leading-relaxed">Literally: {bookmark.literal}</p>
+          )}
         </div>
         <Button variant="ghost" size="icon" onClick={onRemove} className="h-8 w-8 rounded-full hover:bg-destructive/15 flex-shrink-0">
           <X className="w-4 h-4 text-muted-foreground" />

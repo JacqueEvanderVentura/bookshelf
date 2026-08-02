@@ -86,6 +86,56 @@ async function moreExamples(word, alreadyHave, context) {
   return JSON.parse(data.choices[0].message.content)
 }
 
+async function explainPhrase(phrase, context) {
+  const apiKey = process.env.FIREWORKS_API_KEY
+  if (!apiKey) throw new Error('FIREWORKS_API_KEY missing')
+
+  const systemPrompt = `You are a warm English tutor helping a learner understand a phrase they highlighted in a book. Respond ONLY with valid JSON in this exact shape:
+{
+  "phrase": "the phrase as given (trimmed)",
+  "type": "idiom" | "saying" | "proverb" | "expression" | "phrase" | "sentence",
+  "meaning": "a clear, simple explanation of what this really means in context (max 45 words)",
+  "literal": "if it's an idiom/saying whose meaning differs from the words, briefly say what the words literally describe. Otherwise null.",
+  "examples": ["natural, simple example 1", "natural, simple example 2"]
+}
+Use short simple English suited for learners. No markdown. No prose outside JSON.`
+
+  const userPrompt = `Highlighted phrase: "${phrase}"\nSurrounding context: "${context || ''}"`
+
+  let lastError = null
+  for (const model of MODEL_CHAIN) {
+    try {
+      const res = await fetch(FIREWORKS_URL, {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          model,
+          messages: [
+            { role: 'system', content: systemPrompt },
+            { role: 'user', content: userPrompt },
+          ],
+          response_format: { type: 'json_object' },
+          max_tokens: 500,
+          temperature: 0.3,
+        }),
+      })
+      if (!res.ok) { lastError = `Fireworks ${model} → ${res.status}`; continue }
+      const data = await res.json()
+      const content = data?.choices?.[0]?.message?.content
+      if (!content) { lastError = 'empty content'; continue }
+      const parsed = JSON.parse(content)
+      return { ...parsed, isPhrase: true, model }
+    } catch (e) {
+      lastError = e.message
+      continue
+    }
+  }
+  throw new Error(`All models failed: ${lastError}`)
+}
+
 export async function GET(request, { params }) {
   const path = (await params)?.path || []
   const route = path.join('/')
@@ -112,6 +162,16 @@ export async function POST(request, { params }) {
     if (route === 'more-examples') {
       const { word, have, context } = await request.json()
       const result = await moreExamples(word, have, context)
+      return NextResponse.json(result)
+    }
+    if (route === 'explain') {
+      const { phrase, context } = await request.json()
+      if (!phrase || typeof phrase !== 'string') {
+        return NextResponse.json({ error: 'phrase_required' }, { status: 400 })
+      }
+      const trimmed = phrase.trim().slice(0, 500)
+      if (!trimmed) return NextResponse.json({ error: 'invalid_phrase' }, { status: 400 })
+      const result = await explainPhrase(trimmed, context)
       return NextResponse.json(result)
     }
     return NextResponse.json({ error: 'not_found' }, { status: 404 })

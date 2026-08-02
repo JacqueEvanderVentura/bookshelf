@@ -105,6 +105,15 @@
   border-radius: 4px;
 }
 
+/* Long-press phrase selection highlight */
+.phrase-selected {
+  background-color: hsl(33 80% 72% / 0.55);
+  border-radius: 3px;
+  transition: background-color 0.08s ease;
+  box-shadow: 0 0 0 1px hsl(28 51% 55% / 0.15);
+}
+
+
 /* Cozy paper texture on cards */
 .paper-texture {
   background-color: hsl(35 100% 98%);
