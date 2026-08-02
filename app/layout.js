@@ -16,7 +16,10 @@ const inter = Inter({
   display: 'swap',
 })
 
+const siteUrl = process.env.SITE_URL
+
 export const metadata = {
+  ...(siteUrl ? { metadataBase: new URL(siteUrl) } : {}),
   title: "Danini's Bookshelf",
   description: 'A warm reading corner for learning English, one word at a time.',
   manifest: '/site.webmanifest',

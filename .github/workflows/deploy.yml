@@ -29,6 +29,7 @@ jobs:
       - run: npm run build
         env:
           GITHUB_PAGES: 'true'
+          SITE_URL: 'https://jacqueevanderventura.github.io/bookshelf'
           NEXT_PUBLIC_FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
 
       - uses: actions/upload-pages-artifact@v3
