@@ -5,7 +5,8 @@ import { motion, AnimatePresence } from 'framer-motion'
 import {
   BookOpen, ArrowLeft, Bookmark, BookmarkCheck, Volume2,
   Play, Pause, Sparkles, Loader2, X, Plus,
-  ChevronRight, ChevronLeft, Coffee, Heart, Type, FolderOpen, FileUp, Trash2
+  ChevronRight, ChevronLeft, Coffee, Heart, Type, FolderOpen, FileUp, Trash2,
+  Library, Book
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -19,6 +20,7 @@ const STORAGE_KEYS = {
   BOOKMARKS: 'cozy_bookmarks_v1',
   DEF_CACHE: 'cozy_def_cache_v1',
   SETTINGS: 'cozy_settings_v1',
+  LAST_BOOK: 'cozy_last_book_v1',
 }
 
 // -------------- LocalStorage helpers --------------
@@ -61,11 +63,13 @@ function App() {
   const [selectedWord, setSelectedWord] = useState(null)
   const [userBooks, setUserBooks] = useState([])
   const [scanning, setScanning] = useState(null) // { total, done, current }
+  const [lastBookId, setLastBookId] = useState(null)
 
   useEffect(() => {
     setProgress(loadLS(STORAGE_KEYS.PROGRESS, {}))
     setBookmarks(loadLS(STORAGE_KEYS.BOOKMARKS, []))
     setDefCache(loadLS(STORAGE_KEYS.DEF_CACHE, {}))
+    setLastBookId(loadLS(STORAGE_KEYS.LAST_BOOK, null))
     // Load user's imported books from IndexedDB
     getAllBooks().then(books => setUserBooks(books || []))
     // Warm up voices on iOS
@@ -173,12 +177,32 @@ function App() {
   const openBook = (book) => {
     setActiveBook(book)
     setView('reader')
+    setLastBookId(book.id)
+    saveLS(STORAGE_KEYS.LAST_BOOK, book.id)
     window.scrollTo(0, 0)
   }
   const closeBook = () => {
     setActiveBook(null)
     setView('shelf')
   }
+
+  // Bottom nav "Read" handler
+  const goToReader = useCallback(() => {
+    // Prefer the last opened book
+    const all = [...userBooks, ...SAMPLE_BOOKS]
+    let book = lastBookId ? all.find(b => b.id === lastBookId) : null
+    // Fallback: most recent by progress.lastRead
+    if (!book) {
+      const sorted = Object.entries(progress)
+        .map(([id, p]) => ({ book: all.find(b => b.id === id), p }))
+        .filter(x => x.book)
+        .sort((a, b) => (b.p.lastRead || 0) - (a.p.lastRead || 0))
+      if (sorted.length) book = sorted[0].book
+    }
+    // Fallback: first sample book so tap always does something
+    if (!book) book = SAMPLE_BOOKS[0]
+    if (book) openBook(book)
+  }, [lastBookId, userBooks, progress]) // eslint-disable-line
 
   const updateProgress = useCallback((bookId, patch) => {
     setProgress(prev => {
@@ -269,7 +293,74 @@ function App() {
         onBookmark={addBookmark}
         bookmarks={bookmarks}
       />
+
+      {/* Bottom nav (hidden while reading for an immersive experience) */}
+      {view !== 'reader' && (
+        <BottomNav
+          current={view}
+          onGoShelf={() => setView('shelf')}
+          onGoRead={goToReader}
+          onGoBookmarks={() => setView('bookmarks')}
+          hasLastBook={!!lastBookId || Object.keys(progress).length > 0}
+          bookmarkCount={bookmarks.length}
+        />
+      )}
     </div>
+  )
+}
+
+// ============================================================
+// BOTTOM NAV BAR
+// ============================================================
+function BottomNav({ current, onGoShelf, onGoRead, onGoBookmarks, hasLastBook, bookmarkCount }) {
+  return (
+    <nav className="fixed bottom-0 left-0 right-0 z-30 safe-bottom border-t border-border/60 bg-background/95 backdrop-blur-md">
+      <div className="max-w-md mx-auto flex items-stretch justify-around px-2 pt-1.5 pb-1">
+        <NavTab
+          active={current === 'shelf'}
+          onClick={onGoShelf}
+          icon={<Library className="w-5 h-5" strokeWidth={2.2} />}
+          label="Bookshelf"
+        />
+        <NavTab
+          active={current === 'reader'}
+          onClick={onGoRead}
+          icon={<Book className="w-5 h-5" strokeWidth={2.2} />}
+          label={hasLastBook ? 'Read' : 'Start Reading'}
+        />
+        <NavTab
+          active={current === 'bookmarks'}
+          onClick={onGoBookmarks}
+          icon={<Bookmark className="w-5 h-5" strokeWidth={2.2} />}
+          label="Bookmarks"
+          badge={bookmarkCount > 0 ? bookmarkCount : null}
+        />
+      </div>
+    </nav>
+  )
+}
+
+function NavTab({ active, onClick, icon, label, badge }) {
+  return (
+    <button
+      onClick={onClick}
+      className={`flex-1 flex flex-col items-center justify-center gap-0.5 py-1.5 px-2 rounded-xl transition-colors relative ${
+        active ? 'text-secondary' : 'text-muted-foreground hover:text-foreground'
+      }`}
+    >
+      <div className={`relative ${active ? 'scale-110 transition-transform' : ''}`}>
+        {icon}
+        {badge != null && (
+          <span className="absolute -top-1.5 -right-2 bg-secondary text-white text-[9px] font-semibold rounded-full min-w-[16px] h-[16px] px-1 grid place-items-center">
+            {badge > 99 ? '99+' : badge}
+          </span>
+        )}
+      </div>
+      <span className={`text-[10.5px] font-medium tracking-tight ${active ? 'text-secondary' : ''}`}>{label}</span>
+      {active && (
+        <span className="absolute top-0 left-1/2 -translate-x-1/2 w-8 h-0.5 rounded-full bg-secondary" />
+      )}
+    </button>
   )
 }
 
@@ -325,25 +416,11 @@ function BookshelfView({ books, progress, onOpenBook, onOpenBookmarks, bookmarkC
             >
               <Plus className="w-5 h-5 text-secondary" />
             </Button>
-            <Button
-              variant="ghost"
-              size="icon"
-              className="rounded-full h-11 w-11 hover:bg-primary/15 relative"
-              onClick={onOpenBookmarks}
-              aria-label="Bookmarks"
-            >
-              <Bookmark className="w-5 h-5 text-secondary" />
-              {bookmarkCount > 0 && (
-                <span className="absolute -top-0.5 -right-0.5 bg-secondary text-white text-[10px] font-semibold rounded-full min-w-[18px] h-[18px] px-1 grid place-items-center">
-                  {bookmarkCount > 99 ? '99+' : bookmarkCount}
-                </span>
-              )}
-            </Button>
           </div>
         </div>
       </header>
 
-      <main className="max-w-4xl mx-auto px-5 pb-24 pt-2 safe-bottom">
+      <main className="max-w-4xl mx-auto px-5 pb-32 pt-2 safe-bottom">
         {continueReading.length > 0 && (
           <section className="mt-6 mb-8">
             <h2 className="font-serif-cozy text-sm font-medium text-muted-foreground uppercase tracking-widest mb-3 px-1 flex items-center gap-1.5">
@@ -1122,7 +1199,7 @@ function BookmarksView({ bookmarks, onBack, onRemove, onOpenBook }) {
         </div>
       </header>
 
-      <main className="max-w-2xl mx-auto px-5 pt-6 pb-24 safe-bottom">
+      <main className="max-w-2xl mx-auto px-5 pt-6 pb-32 safe-bottom">
         {bookmarks.length === 0 ? (
           <div className="mt-20 text-center text-muted-foreground">
             <div className="w-16 h-16 mx-auto rounded-full bg-primary/15 grid place-items-center mb-4">
