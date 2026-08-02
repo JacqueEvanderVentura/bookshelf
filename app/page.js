@@ -390,6 +390,7 @@ function BookshelfView({ books, progress, onOpenBook, onOpenBookmarks, bookmarkC
         multiple
         style={{ display: 'none' }}
         onChange={(e) => { onPickFiles(e.target.files); e.target.value = ''; setShowAddSheet(false) }}
+        suppressHydrationWarning
       />
       <input
         ref={folderInputRef}
@@ -399,6 +400,7 @@ function BookshelfView({ books, progress, onOpenBook, onOpenBookmarks, bookmarkC
         directory=""
         style={{ display: 'none' }}
         onChange={(e) => { onPickFiles(e.target.files); e.target.value = ''; setShowAddSheet(false) }}
+        suppressHydrationWarning
       />
 
       {/* Add books sheet */}
@@ -523,11 +525,17 @@ function BookCard({ book, progress, onOpen, onRemove }) {
     e.stopPropagation()
     if (confirm(`Remove "${book.title}" from your shelf?`)) onRemove()
   }
+  const handleKey = (e) => {
+    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen() }
+  }
   return (
-    <motion.button
+    <motion.div
       whileTap={{ scale: 0.97 }}
       onClick={onOpen}
-      className="text-left group focus:outline-none relative"
+      onKeyDown={handleKey}
+      role="button"
+      tabIndex={0}
+      className="text-left group focus:outline-none relative cursor-pointer"
     >
       <div className={`aspect-[2/3] rounded-2xl ${book.coverClass} shadow-md relative overflow-hidden`}>
         <div className="absolute inset-0 bg-gradient-to-br from-white/10 to-black/20" />
@@ -546,8 +554,9 @@ function BookCard({ book, progress, onOpen, onRemove }) {
         )}
         {onRemove && (
           <button
+            type="button"
             onClick={handleRemove}
-            className="absolute top-2 right-2 w-7 h-7 rounded-full bg-black/40 hover:bg-black/60 grid place-items-center opacity-0 group-hover:opacity-100 transition-opacity"
+            className="absolute top-2 right-2 w-7 h-7 rounded-full bg-black/40 hover:bg-black/60 grid place-items-center opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
             aria-label="Remove book"
           >
             <Trash2 className="w-3.5 h-3.5 text-white" />
@@ -558,7 +567,7 @@ function BookCard({ book, progress, onOpen, onRemove }) {
         <div className="text-sm font-medium leading-tight line-clamp-1">{book.title}</div>
         <div className="text-xs text-muted-foreground mt-0.5">{book.author}</div>
       </div>
-    </motion.button>
+    </motion.div>
   )
 }
 
