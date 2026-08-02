@@ -322,8 +322,9 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
   const [fontSize, setFontSize] = useState(loadLS(STORAGE_KEYS.SETTINGS, {})?.fontSize || 20)
   const [readingAloud, setReadingAloud] = useState(false)
   const [speakingWord, setSpeakingWord] = useState(null)
-  const [livePercent, setLivePercent] = useState(progress?.percent || 0)
   const scrollRef = useRef(null)
+  const barRef = useRef(null)         // Direct DOM ref for progress bar
+  const percentTextRef = useRef(null) // Direct DOM ref for "% complete" text
   const chapter = book.chapters[chapterIdx]
 
   const bookmarkedWords = useMemo(() => {
@@ -341,26 +342,36 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
     if (!el) return
     let rafId = null
     let timer
+    let lastPct = -1
+
+    const paint = () => {
+      rafId = null
+      const total = el.scrollHeight - el.clientHeight
+      const pct = total > 0 ? Math.min(100, (el.scrollTop / total) * 100) : 0
+      // Directly mutate DOM — no React re-render, no CSS transition
+      if (barRef.current) barRef.current.style.width = pct + '%'
+      const rounded = Math.round(pct)
+      if (rounded !== lastPct && percentTextRef.current) {
+        percentTextRef.current.textContent = rounded + '% complete'
+        lastPct = rounded
+      }
+    }
+
     const onScroll = () => {
-      // Live update via requestAnimationFrame (no throttle for UI)
-      if (rafId) return
-      rafId = requestAnimationFrame(() => {
-        rafId = null
-        const total = el.scrollHeight - el.clientHeight
-        const percent = total > 0 ? Math.min(100, (el.scrollTop / total) * 100) : 0
-        setLivePercent(percent)
-      })
+      if (rafId == null) rafId = requestAnimationFrame(paint)
       // Debounce persistent save separately
       clearTimeout(timer)
       timer = setTimeout(() => {
         const total = el.scrollHeight - el.clientHeight
-        const percent = total > 0 ? Math.min(100, Math.round((el.scrollTop / total) * 100)) : 0
-        onUpdateProgress({ chapter: chapterIdx, scroll: el.scrollTop, percent })
+        const pct = total > 0 ? Math.min(100, Math.round((el.scrollTop / total) * 100)) : 0
+        onUpdateProgress({ chapter: chapterIdx, scroll: el.scrollTop, percent: pct })
       }, 400)
     }
+
     el.addEventListener('scroll', onScroll, { passive: true })
-    // Initial calc
-    onScroll()
+    // Paint initial state (after mount)
+    requestAnimationFrame(paint)
+
     return () => {
       el.removeEventListener('scroll', onScroll)
       clearTimeout(timer)
@@ -423,7 +434,7 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
 
   useEffect(() => () => { if (typeof window !== 'undefined' && window.speechSynthesis) window.speechSynthesis.cancel() }, [])
 
-  const percent = Math.round(livePercent)
+  const initialPercent = progress?.percent || 0
 
   const handleWordTap = (word, paraIdx, wordIdx, paraText) => {
     onSelectWord({
@@ -456,7 +467,7 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
               {book.title}
             </div>
             <div className="text-[11px] text-muted-foreground mt-0.5">
-              {chapter.title.split(' — ')[0]} · {percent}% complete
+              {chapter.title.split(' — ')[0]} · <span ref={percentTextRef}>{initialPercent}% complete</span>
             </div>
           </div>
           <div className="flex items-center gap-1">
@@ -475,7 +486,7 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
           </div>
         </div>
         <div className="mt-2.5 h-0.5 bg-muted/60 rounded-full overflow-hidden">
-          <div className="h-full bg-primary" style={{ width: `${percent}%` }} />
+          <div ref={barRef} className="h-full bg-primary" style={{ width: `${initialPercent}%` }} />
         </div>
       </header>
 
