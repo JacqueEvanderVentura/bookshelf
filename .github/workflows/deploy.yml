@@ -26,10 +26,21 @@ jobs:
 
       - run: npm ci
 
-      - run: npm run build
+      - name: Build static site
+        run: npm run build
         env:
           GITHUB_PAGES: 'true'
+          GITHUB_SHA: ${{ github.sha }}
           NEXT_PUBLIC_FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+
+      - name: Verify service worker was stamped
+        run: |
+          test -f out/sw.js
+          test -f out/build-id.txt
+          BUILD_ID=$(cat out/build-id.txt | tr -d '\n')
+          echo "PWA build id: $BUILD_ID"
+          grep -q "bookshelf-${BUILD_ID}" out/sw.js
+          ! grep -q '__BUILD_ID__' out/sw.js
 
       - uses: actions/upload-pages-artifact@v3
         with:
