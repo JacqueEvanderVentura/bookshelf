@@ -1,14 +1,12 @@
-const CACHE = 'bookshelf-v2'
+const CACHE = 'bookshelf-v3'
 const PRECACHE = [
-  '/',
-  '/manifest.json',
-  '/icon-192.svg',
-  '/icon-512.svg',
+  './',
+  './site.webmanifest',
 ]
 
 self.addEventListener('install', (event) => {
   event.waitUntil(
-    caches.open(CACHE).then((cache) => cache.addAll(PRECACHE))
+    caches.open(CACHE).then((cache) => cache.addAll(PRECACHE).catch(() => {}))
   )
   self.skipWaiting()
 })
