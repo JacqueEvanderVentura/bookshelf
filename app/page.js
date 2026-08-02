@@ -17,6 +17,7 @@ import { SAMPLE_BOOKS } from '@/lib/sample-books'
 import { parseEpub, randomCover } from '@/lib/epub-parser'
 import { saveBook, getAllBooks, deleteBook } from '@/lib/library-store'
 import { getWatchConfig, saveWatchConfig, updateKnownFiles, clearWatchConfig, saveDirHandle, getDirHandle } from '@/lib/watch-store'
+import { defineWord, explainPhrase, moreExamples } from '@/lib/fireworks-client'
 
 const STORAGE_KEYS = {
   PROGRESS: 'cozy_progress_v1',
@@ -1939,20 +1940,11 @@ function DefinitionPanel({ selection, onClose, cache, onCache, onBookmark, bookm
     setError(null)
     setDef(null)
 
-    const url = isPhraseMode ? '/api/explain' : '/api/define'
-    const body = isPhraseMode
-      ? { phrase: word, context: selection.context?.slice(0, 600) || '' }
-      : { word: wordLower, context: selection.context?.slice(0, 400) || '' }
+    const promise = isPhraseMode
+      ? explainPhrase(word, selection.context?.slice(0, 600) || '')
+      : defineWord(wordLower, selection.context?.slice(0, 400) || '')
 
-    fetch(url, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(body),
-    })
-      .then(async (r) => {
-        if (!r.ok) throw new Error('Lookup failed')
-        return r.json()
-      })
+    promise
       .then((data) => {
         setDef(data)
         onCache(cacheKey, data)
@@ -1985,12 +1977,7 @@ function DefinitionPanel({ selection, onClose, cache, onCache, onBookmark, bookm
     if (!def || loadingMore) return
     setLoadingMore(true)
     try {
-      const r = await fetch('/api/more-examples', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ word: word, have: def.examples || [], context: selection?.context || '' }),
-      })
-      const data = await r.json()
+      const data = await moreExamples(word, def.examples || [], selection?.context || '')
       if (data.examples?.length) {
         const updated = { ...def, examples: [...(def.examples || []), ...data.examples] }
         setDef(updated)
