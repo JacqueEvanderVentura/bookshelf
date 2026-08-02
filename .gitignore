@@ -7,6 +7,7 @@
 # Dependencies
 node_modules/
 /node_modules
+package-lock.json
 /.pnp
 .pnp.js
 .yarn/install-state.gz
@@ -33,6 +34,8 @@ dist
 # Environment files (comprehensive coverage)
 *token.json*
 *credentials.json*
+.env
+.env.*
 
 # Logs and debug files
 npm-debug.log*

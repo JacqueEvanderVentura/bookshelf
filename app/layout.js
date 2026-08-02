@@ -1,6 +1,7 @@
 import { Fraunces, Inter } from 'next/font/google'
 import './globals.css'
 import { Toaster } from '@/components/ui/sonner'
+import SWRegister from './sw-register'
 
 const fraunces = Fraunces({
   subsets: ['latin'],
@@ -16,13 +17,13 @@ const inter = Inter({
 })
 
 export const metadata = {
-  title: "Daniela's Cozy Bookshelf",
+  title: "Danini's Bookshelf",
   description: 'A warm reading corner for learning English, one word at a time.',
-  manifest: '/manifest.json',
+  manifest: '/site.webmanifest',
   appleWebApp: {
     capable: true,
     statusBarStyle: 'default',
-    title: "Daniela's Bookshelf",
+    title: "Danini's Bookshelf",
   },
 }
 
@@ -39,6 +40,7 @@ export default function RootLayout({ children }) {
     <html lang="en" className={`${fraunces.variable} ${inter.variable}`}>
       <body className="font-sans antialiased">
         {children}
+        <SWRegister />
         <Toaster position="top-center" />
       </body>
     </html>

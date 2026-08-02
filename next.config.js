@@ -1,19 +1,20 @@
+const isGHPages = process.env.GITHUB_PAGES === 'true'
+
 const nextConfig = {
-  output: 'standalone',
+  output: isGHPages ? 'export' : 'standalone',
+  basePath: isGHPages ? '/bookshelf' : '',
   images: {
     unoptimized: true,
     remotePatterns: [
       { protocol: 'https', hostname: 'avatars.githubusercontent.com', pathname: '/**' },
     ],
   },
-  // Renamed from experimental.serverComponentsExternalPackages in Next 15
   serverExternalPackages: ['mongodb'],
   webpack(config, { dev }) {
     if (dev) {
-      // Reduce CPU/memory from file watching
       config.watchOptions = {
-        poll: 2000, // check every 2 seconds
-        aggregateTimeout: 300, // wait before rebuilding
+        poll: 2000,
+        aggregateTimeout: 300,
         ignored: ['**/node_modules'],
       };
     }

@@ -6,7 +6,7 @@ import {
   BookOpen, ArrowLeft, Bookmark, BookmarkCheck, Volume2,
   Play, Pause, Sparkles, Loader2, X, Plus,
   ChevronRight, ChevronLeft, Coffee, Heart, Type, FolderOpen, FileUp, Trash2,
-  Library, Book, Settings2, Star, Flame, Check, Tag
+  Library, Book, Settings2, Star, Flame, Check, Tag, RefreshCw
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -16,6 +16,7 @@ import { toast } from 'sonner'
 import { SAMPLE_BOOKS } from '@/lib/sample-books'
 import { parseEpub, randomCover } from '@/lib/epub-parser'
 import { saveBook, getAllBooks, deleteBook } from '@/lib/library-store'
+import { getWatchConfig, saveWatchConfig, updateKnownFiles, clearWatchConfig, saveDirHandle, getDirHandle } from '@/lib/watch-store'
 
 const STORAGE_KEYS = {
   PROGRESS: 'cozy_progress_v1',
@@ -25,6 +26,7 @@ const STORAGE_KEYS = {
   LAST_BOOK: 'cozy_last_book_v1',
   BOOK_META: 'cozy_book_meta_v1',
   CATEGORIES: 'cozy_categories_v1',
+  STATS: 'cozy_stats_v1',
 }
 
 // -------------- LocalStorage helpers --------------
@@ -71,6 +73,18 @@ function App() {
   const [bookMeta, setBookMeta] = useState({}) // { bookId: { category, rating, difficulty } }
   const [customCategories, setCustomCategories] = useState([])
   const [metaEditingBook, setMetaEditingBook] = useState(null) // book being edited
+  const watchDirRef = useRef(null) // live FileSystemDirectoryHandle
+  const knownFilesRef = useRef({}) // { path: lastModified }
+  const pollTimerRef = useRef(null)
+  const importedKeysRef = useRef(new Set()) // 'title|author' → skip duplicates
+  const [watchFolderName, setWatchFolderName] = useState(null)
+  const [watchPolling, setWatchPolling] = useState(false)
+  const [newBooksDetected, setNewBooksDetected] = useState(0)
+  const [stats, setStats] = useState(() => {
+    const today = new Date().toISOString().slice(0, 10)
+    return loadLS(STORAGE_KEYS.STATS, { streak: 0, lastReadDate: null, booksStarted: [], todayMinutes: 0, todayDate: today })
+  })
+  const readingTimerRef = useRef(null)
 
   useEffect(() => {
     setProgress(loadLS(STORAGE_KEYS.PROGRESS, {}))
@@ -80,11 +94,31 @@ function App() {
     setBookMeta(loadLS(STORAGE_KEYS.BOOK_META, {}))
     setCustomCategories(loadLS(STORAGE_KEYS.CATEGORIES, []))
     // Load user's imported books from IndexedDB
-    getAllBooks().then(books => setUserBooks(books || []))
+    getAllBooks().then(books => {
+      setUserBooks(books || [])
+      importedKeysRef.current = new Set((books || []).map(b => `${b.title.toLowerCase()}|${b.author.toLowerCase()}`))
+    })
     // Warm up voices on iOS
     if (typeof window !== 'undefined' && window.speechSynthesis) {
       window.speechSynthesis.getVoices()
     }
+    // Load watch folder config from IndexedDB and resume watching
+    (async () => {
+      const cfg = await getWatchConfig()
+      if (!cfg || !cfg.folderName) return
+      knownFilesRef.current = cfg.knownFiles || {}
+      setWatchFolderName(cfg.folderName)
+      const handle = await getDirHandle()
+      if (!handle) return
+      try {
+        const perm = await handle.queryPermission({ mode: 'read' })
+        if (perm === 'granted' || perm === 'prompt') {
+          if (perm === 'prompt') await handle.requestPermission({ mode: 'read' })
+          watchDirRef.current = handle
+          startPolling(handle)
+        }
+      } catch { /* handle no longer valid */ }
+    })()
   }, [])
 
   // Merge original book with user overrides (category/rating/difficulty)
@@ -161,6 +195,9 @@ function App() {
         setScanning({ total: files.length, done: i, current: file.name })
         try {
           const parsed = await parseEpub(file, folder)
+          const key = `${parsed.title.toLowerCase()}|${parsed.author.toLowerCase()}`
+          if (importedKeysRef.current.has(key)) continue
+          importedKeysRef.current.add(key)
           const id = `user_${crypto.randomUUID()}`
           const book = {
             id,
@@ -191,12 +228,13 @@ function App() {
 
   const pickDirectory = async () => {
     if (typeof window === 'undefined' || !window.showDirectoryPicker) {
-      toast.error('Folder picker not supported on this browser. Use "Pick files" instead.')
+      toast.error('Folder picker not supported on this browser. Use "Pick book" instead.')
       return
     }
     try {
       const handle = await window.showDirectoryPicker({ mode: 'read' })
       await importFromSource(handle)
+      startWatching(handle)
     } catch (e) {
       if (e.name !== 'AbortError') toast.error('Could not open folder')
     }
@@ -207,16 +245,227 @@ function App() {
   }
 
   const removeUserBook = async (id) => {
+    const book = userBooks.find(b => b.id === id)
+    if (book) importedKeysRef.current.delete(`${book.title.toLowerCase()}|${book.author.toLowerCase()}`)
     await deleteBook(id)
     setUserBooks(prev => prev.filter(b => b.id !== id))
     toast.success('Book removed')
   }
+
+  // Helper: recursively walk a dir handle and populate knownFiles map
+  const walkDirForTimestamps = async (dirHandle) => {
+    const map = {}
+    async function walk(dh, prefix = '') {
+      for await (const entry of dh.values()) {
+        if (entry.kind === 'file' && /\.epub$/i.test(entry.name)) {
+          const file = await entry.getFile()
+          map[prefix + entry.name] = file.lastModified
+        } else if (entry.kind === 'directory') {
+          await walk(entry, prefix + entry.name + '/')
+        }
+      }
+    }
+    await walk(dirHandle)
+    return map
+  }
+
+  // Start a 30-second polling cycle; returns a cleanup function
+  const startPolling = useCallback((handle) => {
+    if (pollTimerRef.current) clearInterval(pollTimerRef.current)
+    const runScan = async () => {
+      setWatchPolling(true)
+      try {
+        const known = { ...knownFilesRef.current }
+        const found = []
+        async function walk(dirHandle, prefix = '') {
+          for await (const entry of dirHandle.values()) {
+            if (entry.kind === 'file' && /\.epub$/i.test(entry.name)) {
+              const file = await entry.getFile()
+              const key = prefix + entry.name
+              if (!known[key] || known[key] !== file.lastModified) {
+                const folderName = prefix ? prefix.replace(/\/$/, '').split('/').pop() : handle.name
+                found.push({ file, folder: folderName })
+              }
+              known[key] = file.lastModified
+            } else if (entry.kind === 'directory') {
+              await walk(entry, prefix + entry.name + '/')
+            }
+          }
+        }
+        await walk(handle)
+        knownFilesRef.current = known
+        updateKnownFiles(known)
+
+        if (found.length > 0) {
+          setNewBooksDetected(prev => prev + found.length)
+          setScanning({ total: found.length, done: 0, current: found[0].file.name })
+          const imported = []
+          for (let i = 0; i < found.length; i++) {
+            const { file, folder } = found[i]
+            setScanning({ total: found.length, done: i, current: file.name })
+            try {
+              const parsed = await parseEpub(file, folder)
+              const key = `${parsed.title.toLowerCase()}|${parsed.author.toLowerCase()}`
+              if (importedKeysRef.current.has(key)) continue
+              importedKeysRef.current.add(key)
+              const id = `user_${crypto.randomUUID()}`
+              const book = {
+                id,
+                title: parsed.title,
+                author: parsed.author,
+                category: parsed.category || folder,
+                coverClass: randomCover(id),
+                chapters: parsed.chapters,
+                addedAt: Date.now(),
+                source: 'user',
+              }
+              await saveBook(book)
+              imported.push(book)
+            } catch (e) {
+              console.warn('Skipping', file.name, e)
+            }
+          }
+          setScanning(null)
+          if (imported.length > 0) {
+            setUserBooks(prev => [...prev, ...imported])
+            toast.success(`Added ${imported.length} new book${imported.length !== 1 ? 's' : ''} from "${handle.name}"`)
+          }
+        }
+      } catch (e) {
+        console.warn('Watch scan error:', e)
+      }
+      setWatchPolling(false)
+    }
+    pollTimerRef.current = setInterval(runScan, 30000)
+    runScan() // Immediate first scan
+  }, [])
+
+  const startWatching = useCallback(async (handle) => {
+    watchDirRef.current = handle
+    knownFilesRef.current = await walkDirForTimestamps(handle)
+    await saveWatchConfig({ folderName: handle.name, knownFiles: knownFilesRef.current })
+    await saveDirHandle(handle)
+    setWatchFolderName(handle.name)
+    setNewBooksDetected(0)
+    startPolling(handle)
+    toast.success(`Now watching "${handle.name}" for new books`)
+  }, [startPolling])
+
+  const setupWatchFolder = useCallback(async () => {
+    if (typeof window === 'undefined' || !window.showDirectoryPicker) {
+      toast.error('Folder watching is only supported in Chrome or Edge')
+      return
+    }
+    try {
+      const handle = await window.showDirectoryPicker({ mode: 'read' })
+      await startWatching(handle)
+    } catch (e) {
+      if (e.name !== 'AbortError') toast.error('Could not open folder')
+    }
+  }, [startWatching])
+
+  const scanNow = useCallback(() => {
+    if (pollTimerRef.current) {
+      clearInterval(pollTimerRef.current)
+      pollTimerRef.current = setInterval(async () => {
+        if (!watchDirRef.current) return
+        setWatchPolling(true)
+        try {
+          const known = { ...knownFilesRef.current }
+          const found = []
+          async function walk(dirHandle, prefix = '') {
+            for await (const entry of dirHandle.values()) {
+              if (entry.kind === 'file' && /\.epub$/i.test(entry.name)) {
+                const file = await entry.getFile()
+                const key = prefix + entry.name
+                if (!known[key] || known[key] !== file.lastModified) {
+                  found.push({ file, folder: prefix ? prefix.replace(/\/$/, '').split('/').pop() : watchDirRef.current.name })
+                }
+                known[key] = file.lastModified
+              } else if (entry.kind === 'directory') {
+                await walk(entry, prefix + entry.name + '/')
+              }
+            }
+          }
+          await walk(watchDirRef.current)
+          knownFilesRef.current = known
+          updateKnownFiles(known)
+          if (found.length > 0) {
+            setNewBooksDetected(prev => prev + found.length)
+            setScanning({ total: found.length, done: 0, current: found[0].file.name })
+            const imported = []
+            for (let i = 0; i < found.length; i++) {
+              const { file, folder } = found[i]
+              setScanning({ total: found.length, done: i, current: file.name })
+              try {
+                const parsed = await parseEpub(file, folder)
+                const key = `${parsed.title.toLowerCase()}|${parsed.author.toLowerCase()}`
+                if (importedKeysRef.current.has(key)) continue
+                importedKeysRef.current.add(key)
+                const id = `user_${crypto.randomUUID()}`
+                const book = {
+                  id, title: parsed.title, author: parsed.author,
+                  category: parsed.category || folder,
+                  coverClass: randomCover(id), chapters: parsed.chapters,
+                  addedAt: Date.now(), source: 'user',
+                }
+                await saveBook(book)
+                imported.push(book)
+              } catch (e) { console.warn('Skipping', file.name, e) }
+            }
+            setScanning(null)
+            if (imported.length > 0) {
+              setUserBooks(prev => [...prev, ...imported])
+              toast.success(`Added ${imported.length} new book${imported.length !== 1 ? 's' : ''} from "${watchDirRef.current.name}"`)
+            }
+          }
+        } catch (e) { console.warn('Watch scan error:', e) }
+        setWatchPolling(false)
+      }, 30000)
+    }
+  }, [])
+
+  const stopWatching = useCallback(async () => {
+    watchDirRef.current = null
+    knownFilesRef.current = {}
+    if (pollTimerRef.current) { clearInterval(pollTimerRef.current); pollTimerRef.current = null }
+    setWatchFolderName(null)
+    setNewBooksDetected(0)
+    setWatchPolling(false)
+    await clearWatchConfig()
+    toast.success('Stopped watching folder')
+  }, [])
+
+
+  // Stats helper
+  const bumpStats = useCallback((bookId) => {
+    setStats(prev => {
+      const today = new Date().toISOString().slice(0, 10)
+      const yesterday = new Date(Date.now() - 86400000).toISOString().slice(0, 10)
+
+      let streak = prev.streak || 0
+      const last = prev.lastReadDate
+      if (last === today) { /* already read today, streak unchanged */ }
+      else if (last === yesterday) streak += 1
+      else streak = 1
+
+      const booksStarted = prev.booksStarted || []
+      const newBooksStarted = booksStarted.includes(bookId) ? booksStarted : [...booksStarted, bookId]
+
+      const todayMinutes = prev.todayDate === today ? (prev.todayMinutes || 0) : 0
+
+      const next = { streak, lastReadDate: today, booksStarted: newBooksStarted, todayMinutes, todayDate: today }
+      saveLS(STORAGE_KEYS.STATS, next)
+      return next
+    })
+  }, [])
 
   const openBook = (book) => {
     setActiveBook(book)
     setView('reader')
     setLastBookId(book.id)
     saveLS(STORAGE_KEYS.LAST_BOOK, book.id)
+    bumpStats(book.id)
     window.scrollTo(0, 0)
   }
   const closeBook = () => {
@@ -291,6 +540,21 @@ function App() {
     return Array.from(set)
   }, [allBooks, customCategories])
 
+  // Reading timer: tick every minute while in reader view
+  useEffect(() => {
+    if (view !== 'reader') return
+    readingTimerRef.current = setInterval(() => {
+      setStats(prev => {
+        const today = new Date().toISOString().slice(0, 10)
+        const base = prev.todayDate === today ? (prev.todayMinutes || 0) : 0
+        const next = { ...prev, todayMinutes: base + 1, todayDate: today }
+        saveLS(STORAGE_KEYS.STATS, next)
+        return next
+      })
+    }, 60000)
+    return () => { if (readingTimerRef.current) clearInterval(readingTimerRef.current) }
+  }, [view])
+
   return (
     <div className="min-h-screen bg-background">
       <AnimatePresence mode="wait">
@@ -301,11 +565,18 @@ function App() {
               progress={progress}
               onOpenBook={openBook}
               bookmarkCount={bookmarks.length}
+              stats={stats}
               onPickDirectory={pickDirectory}
               onPickFiles={pickFiles}
               onRemoveBook={removeUserBook}
               scanning={scanning}
               onEditMeta={setMetaEditingBook}
+              watchConfig={watchFolderName}
+              watchPolling={watchPolling}
+              newBooksDetected={newBooksDetected}
+              onSetupWatch={setupWatchFolder}
+              onStopWatch={stopWatching}
+              onScanNow={scanNow}
             />
           </motion.div>
         )}
@@ -355,9 +626,11 @@ function App() {
         onAddCategory={addCategory}
       />
 
-      {/* Bottom nav (hidden while reading for an immersive experience) */}
+      {/* Bottom nav + FAB (hidden while reading) */}
       {view !== 'reader' && (
-        <BottomNav
+        <>
+          <AddFab onPickDirectory={pickDirectory} onPickFiles={pickFiles} />
+          <BottomNav
           current={view}
           onGoShelf={() => setView('shelf')}
           onGoRead={goToReader}
@@ -365,6 +638,7 @@ function App() {
           hasLastBook={!!lastBookId || Object.keys(progress).length > 0}
           bookmarkCount={bookmarks.length}
         />
+        </>
       )}
     </div>
   )
@@ -373,6 +647,84 @@ function App() {
 // ============================================================
 // BOTTOM NAV BAR
 // ============================================================
+function AddFab({ onPickDirectory, onPickFiles }) {
+  const [open, setOpen] = useState(false)
+  const filesRef = useRef(null)
+
+  const handlePickFiles = () => {
+    setOpen(false)
+    filesRef.current?.click()
+  }
+
+  const handlePickFolder = () => {
+    setOpen(false)
+    onPickDirectory()
+  }
+
+  return (
+    <>
+      <input
+        ref={filesRef}
+        type="file"
+        accept=".epub,application/epub+zip"
+        multiple
+        style={{ display: 'none' }}
+        onChange={(e) => { onPickFiles(e.target.files); e.target.value = '' }}
+        suppressHydrationWarning
+      />
+      <AnimatePresence>
+        {open && (
+          <motion.div
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-30"
+            onClick={() => setOpen(false)}
+          />
+        )}
+      </AnimatePresence>
+      <AnimatePresence>
+        {open && (
+          <motion.div
+            initial={{ opacity: 0, y: 20, scale: 0.8 }}
+            animate={{ opacity: 1, y: 0, scale: 1 }}
+            exit={{ opacity: 0, y: 20, scale: 0.8 }}
+            transition={{ type: 'spring', stiffness: 400, damping: 28 }}
+            className="fixed bottom-40 right-5 z-40 flex flex-col items-end gap-2"
+          >
+            <button
+              onClick={handlePickFolder}
+              className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-card border border-border shadow-lg hover:bg-primary/10 transition-colors"
+            >
+              <div className="w-9 h-9 rounded-full bg-primary/20 grid place-items-center">
+                <FolderOpen className="w-4 h-4 text-secondary" />
+              </div>
+              <span className="text-sm font-medium whitespace-nowrap">Choose folder</span>
+            </button>
+            <button
+              onClick={handlePickFiles}
+              className="flex items-center gap-3 px-4 py-3 rounded-2xl bg-card border border-border shadow-lg hover:bg-primary/10 transition-colors"
+            >
+              <div className="w-9 h-9 rounded-full bg-primary/20 grid place-items-center">
+                <FileUp className="w-4 h-4 text-secondary" />
+              </div>
+              <span className="text-sm font-medium whitespace-nowrap">Pick book</span>
+            </button>
+          </motion.div>
+        )}
+      </AnimatePresence>
+      <motion.button
+        whileTap={{ scale: 0.9 }}
+        onClick={() => setOpen(prev => !prev)}
+        className={`fixed bottom-[5.5rem] right-5 z-40 w-14 h-14 rounded-full bg-secondary text-white grid place-items-center shadow-lg hover:shadow-xl transition-shadow ${open ? 'rotate-45' : ''}`}
+        aria-label="Add books"
+      >
+        <Plus className="w-6 h-6 transition-transform duration-200" style={{ transform: open ? 'rotate(0deg)' : 'rotate(0deg)' }} />
+      </motion.button>
+    </>
+  )
+}
+
 function BottomNav({ current, onGoShelf, onGoRead, onGoBookmarks, hasLastBook, bookmarkCount }) {
   return (
     <nav className="fixed bottom-0 left-0 right-0 z-30 safe-bottom border-t border-border/60 bg-background/95 backdrop-blur-md">
@@ -428,8 +780,9 @@ function NavTab({ active, onClick, icon, label, badge }) {
 // ============================================================
 // BOOKSHELF VIEW
 // ============================================================
-function BookshelfView({ books, progress, onOpenBook, bookmarkCount, onPickDirectory, onPickFiles, onRemoveBook, scanning, onEditMeta }) {
+function BookshelfView({ books, progress, onOpenBook, bookmarkCount, onPickDirectory, onPickFiles, onRemoveBook, scanning, onEditMeta, watchConfig: watchFolderName, watchPolling, newBooksDetected, onSetupWatch, onStopWatch, onScanNow, stats }) {
   const [showAddSheet, setShowAddSheet] = useState(false)
+  const [scanAnimating, setScanAnimating] = useState(false)
   const filesInputRef = useRef(null)
   const folderInputRef = useRef(null)
 
@@ -462,27 +815,77 @@ function BookshelfView({ books, progress, onOpenBook, bookmarkCount, onPickDirec
               <BookOpen className="w-5 h-5 text-secondary" strokeWidth={2.2} />
             </div>
             <div>
-              <h1 className="font-serif-cozy text-xl font-semibold text-foreground leading-none">Daniela&apos;s Bookshelf</h1>
+              <h1 className="font-serif-cozy text-xl font-semibold text-foreground leading-none">Danini&apos;s Bookshelf</h1>
               <p className="text-[11px] text-muted-foreground mt-0.5 flex items-center gap-1">
                 <Heart className="w-2.5 h-2.5 fill-current text-primary/70" /> one word at a time
               </p>
             </div>
           </div>
-          <div className="flex items-center gap-1">
-            <Button
-              variant="ghost"
-              size="icon"
-              className="rounded-full h-11 w-11 hover:bg-primary/15"
-              onClick={() => setShowAddSheet(true)}
-              aria-label="Add books"
-            >
-              <Plus className="w-5 h-5 text-secondary" />
-            </Button>
-          </div>
         </div>
       </header>
 
       <main className="max-w-4xl mx-auto px-5 pb-32 pt-2 safe-bottom">
+        {watchFolderName && (
+          <div className="mt-3 mb-1 flex flex-col sm:flex-row sm:items-center gap-2 text-xs text-muted-foreground bg-primary/5 rounded-xl px-4 py-2.5 border border-primary/15">
+            <div className="flex items-center gap-2">
+              <div className={`w-1.5 h-1.5 rounded-full ${watchPolling ? 'bg-amber-400 animate-pulse' : 'bg-emerald-400'}`} />
+              <span className="font-medium">Watching </span>
+              <span className="text-foreground font-semibold truncate max-w-[160px] sm:hidden">{watchFolderName}</span>
+            </div>
+            <span className="text-foreground font-semibold truncate max-w-[200px] hidden sm:inline">{watchFolderName}</span>
+            <span className="text-muted-foreground/60">— new .epub files are auto-imported</span>
+            <div className="sm:ml-auto flex items-center gap-2">
+              <button
+                onClick={() => {
+                  setScanAnimating(true)
+                  onScanNow()
+                  setTimeout(() => setScanAnimating(false), 1500)
+                }}
+                disabled={watchPolling}
+                className="flex items-center gap-1 text-secondary hover:underline disabled:opacity-50"
+              >
+                <RefreshCw className={`w-3 h-3 ${scanAnimating ? 'animate-spin' : ''}`} />
+                Scan now
+              </button>
+              <button
+                onClick={onStopWatch}
+                className="px-2.5 py-1 rounded-full text-[11px] font-medium border border-destructive/30 text-destructive hover:bg-destructive/10 transition-colors"
+              >
+                Stop watching
+              </button>
+            </div>
+          </div>
+        )}
+        {newBooksDetected > 0 && !scanning && (
+          <div className="mt-2 mb-1 text-xs text-emerald-600 bg-emerald-50 dark:bg-emerald-950/30 dark:text-emerald-400 rounded-xl px-4 py-2 border border-emerald-200 dark:border-emerald-800/50">
+            {newBooksDetected} new book{newBooksDetected !== 1 ? 's' : ''} auto-imported — scroll to find them below!
+          </div>
+        )}
+        {books.length > 0 && stats && (
+          <section className="mt-4 mb-6">
+            <h2 className="font-serif-cozy text-sm font-medium text-muted-foreground uppercase tracking-widest mb-3 px-1 flex items-center gap-1.5">
+              <Sparkles className="w-3.5 h-3.5" /> Your stats
+            </h2>
+            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+              <div className="paper-texture rounded-2xl border border-border/60 p-4 text-center">
+                <div className="text-3xl font-serif-cozy font-bold text-secondary">{typeof stats.streak === 'number' ? stats.streak : 0}</div>
+                <div className="text-[10px] uppercase tracking-widest text-muted-foreground mt-1">Day streak</div>
+              </div>
+              <div className="paper-texture rounded-2xl border border-border/60 p-4 text-center">
+                <div className="text-3xl font-serif-cozy font-bold text-secondary">{stats.booksStarted?.length || 0}</div>
+                <div className="text-[10px] uppercase tracking-widest text-muted-foreground mt-1">Books started</div>
+              </div>
+              <div className="paper-texture rounded-2xl border border-border/60 p-4 text-center">
+                <div className="text-3xl font-serif-cozy font-bold text-secondary">{bookmarkCount}</div>
+                <div className="text-[10px] uppercase tracking-widest text-muted-foreground mt-1">Words saved</div>
+              </div>
+              <div className="paper-texture rounded-2xl border border-border/60 p-4 text-center">
+                <div className="text-3xl font-serif-cozy font-bold text-secondary">{stats.todayMinutes || 0}</div>
+                <div className="text-[10px] uppercase tracking-widest text-muted-foreground mt-1">Min read today</div>
+              </div>
+            </div>
+          </section>
+        )}
         {books.length === 0 && !scanning && (
           <div className="mt-16 text-center">
             <motion.div
@@ -843,7 +1246,7 @@ function FlameRow({ value }) {
   return <div className="flex gap-0.5">{flames}</div>
 }
 
-function AddBooksSheet({ open, onClose, hasFSA, onPickDirectory, onPickFolderInput, onPickFiles }) {
+function AddBooksSheet({ open, onClose, hasFSA, onPickDirectory, onPickFolderInput, onPickFiles, onSetupWatch }) {
   return (
     <AnimatePresence>
       {open && (
@@ -878,7 +1281,7 @@ function AddBooksSheet({ open, onClose, hasFSA, onPickDirectory, onPickFolderInp
                     </div>
                     <div className="min-w-0">
                       <div className="font-serif-cozy text-base font-semibold leading-tight">Choose a folder</div>
-                      <div className="text-xs text-muted-foreground mt-0.5">We&apos;ll scan it (and subfolders) for books</div>
+                      <div className="text-xs text-muted-foreground mt-0.5">Imports your books & watches for new ones automatically</div>
                     </div>
                   </button>
                 )}
@@ -905,7 +1308,7 @@ function AddBooksSheet({ open, onClose, hasFSA, onPickDirectory, onPickFolderInp
                     <FileUp className="w-5 h-5 text-secondary" />
                   </div>
                   <div className="min-w-0">
-                    <div className="font-serif-cozy text-base font-semibold leading-tight">Pick individual files</div>
+                    <div className="font-serif-cozy text-base font-semibold leading-tight">Pick a book</div>
                     <div className="text-xs text-muted-foreground mt-0.5">Best on iPhone and iPad — tap to select .epub files</div>
                   </div>
                 </button>
@@ -924,6 +1327,9 @@ function AddBooksSheet({ open, onClose, hasFSA, onPickDirectory, onPickFolderInp
 
 function BookCard({ book, progress, onOpen, onEdit, onRemove }) {
   const percent = progress?.percent || 0
+  const lastRead = progress?.lastRead
+    ? new Date(progress.lastRead).toLocaleString('en-US', { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' })
+    : null
   const handleRemove = (e) => {
     e.stopPropagation()
     if (confirm(`Remove "${book.title}" from your shelf?`)) onRemove()
@@ -1003,6 +1409,9 @@ function BookCard({ book, progress, onOpen, onEdit, onRemove }) {
               </span>
             )}
           </div>
+        )}
+        {lastRead && (
+          <div className="text-[10px] text-muted-foreground/70 mt-1">{lastRead}</div>
         )}
       </div>
     </motion.div>
