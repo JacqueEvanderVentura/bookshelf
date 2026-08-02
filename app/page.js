@@ -226,10 +226,13 @@ function App() {
 
   // Bottom nav "Read" handler
   const goToReader = useCallback(() => {
-    // Prefer the last opened book
     const all = [...userBooks, ...SAMPLE_BOOKS]
+    if (all.length === 0) {
+      // No books yet — just go to the shelf so the empty state prompts to add
+      setView('shelf')
+      return
+    }
     let book = lastBookId ? all.find(b => b.id === lastBookId) : null
-    // Fallback: most recent by progress.lastRead
     if (!book) {
       const sorted = Object.entries(progress)
         .map(([id, p]) => ({ book: all.find(b => b.id === id), p }))
@@ -237,8 +240,7 @@ function App() {
         .sort((a, b) => (b.p.lastRead || 0) - (a.p.lastRead || 0))
       if (sorted.length) book = sorted[0].book
     }
-    // Fallback: first sample book so tap always does something
-    if (!book) book = SAMPLE_BOOKS[0]
+    if (!book) book = all[0]
     if (book) openBook(book)
   }, [lastBookId, userBooks, progress]) // eslint-disable-line
 
@@ -481,6 +483,37 @@ function BookshelfView({ books, progress, onOpenBook, bookmarkCount, onPickDirec
       </header>
 
       <main className="max-w-4xl mx-auto px-5 pb-32 pt-2 safe-bottom">
+        {books.length === 0 && !scanning && (
+          <div className="mt-16 text-center">
+            <motion.div
+              initial={{ scale: 0.8, opacity: 0 }}
+              animate={{ scale: 1, opacity: 1 }}
+              transition={{ type: 'spring', stiffness: 200, damping: 18 }}
+              className="w-20 h-20 mx-auto rounded-full bg-primary/20 grid place-items-center mb-5"
+            >
+              <BookOpen className="w-9 h-9 text-secondary" strokeWidth={1.8} />
+            </motion.div>
+            <h2 className="font-serif-cozy text-2xl font-semibold">Your shelf is waiting</h2>
+            <p className="text-sm text-muted-foreground mt-2 max-w-xs mx-auto leading-relaxed">
+              Add a few <span className="font-medium text-secondary">.epub</span> books to start reading — everything stays on your device.
+            </p>
+            <Button
+              onClick={() => setShowAddSheet(true)}
+              className="mt-6 rounded-full bg-secondary hover:bg-secondary/90 text-white px-6 h-11 font-medium"
+            >
+              <Plus className="w-4 h-4 mr-1.5" /> Add your first book
+            </Button>
+            <div className="mt-10 flex items-center justify-center gap-2 text-muted-foreground/70">
+              <div className="h-px w-8 bg-primary/40" />
+              <Heart className="w-3.5 h-3.5 fill-current text-primary/70" />
+              <div className="h-px w-8 bg-primary/40" />
+            </div>
+            <p className="font-serif-cozy italic text-xs text-muted-foreground/80 mt-3">
+              made with love for Dani
+            </p>
+          </div>
+        )}
+
         {continueReading.length > 0 && (
           <section className="mt-6 mb-8">
             <h2 className="font-serif-cozy text-sm font-medium text-muted-foreground uppercase tracking-widest mb-3 px-1 flex items-center gap-1.5">
@@ -514,7 +547,7 @@ function BookshelfView({ books, progress, onOpenBook, bookmarkCount, onPickDirec
           </section>
         ))}
 
-        <div className="mt-12 text-center text-muted-foreground/80">
+        <div className={`mt-12 text-center text-muted-foreground/80 ${books.length === 0 ? 'hidden' : ''}`}>
           <Sparkles className="w-5 h-5 mx-auto mb-2 text-primary/60" />
           <p className="font-serif-cozy italic text-sm">Tap any word while reading to discover its meaning.</p>
         </div>
