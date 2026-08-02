@@ -1465,6 +1465,13 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
   const chapter = book.chapters[chapterIdx] || book.chapters[0]
   const hasMultipleChapters = book.chapters.length > 1
 
+  // Helper: get text content from paragraph item (handles old string format too)
+  const getParaText = useCallback((pIdx) => {
+    const item = chapter.paragraphs[pIdx]
+    if (!item) return ''
+    return typeof item === 'string' ? item : (item.content || '')
+  }, [chapter.paragraphs])
+
   // Cleanup long-press timer on unmount / chapter change
   useEffect(() => () => { if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current) }, [])
 
@@ -1486,7 +1493,7 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
     const { pMin, wMin, pMax, wMax } = range
     const outParts = []
     for (let p = pMin; p <= pMax; p++) {
-      const tokens = tokenize(chapter.paragraphs[p])
+      const tokens = tokenize(getParaText(p))
       let wi = 0
       let text = ''
       let started = false
@@ -1519,7 +1526,7 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
     if (scrollRef.current) scrollRef.current.style.touchAction = ''
     // Trigger panel
     if (phrase && phrase.length > 0) {
-      const context = chapter.paragraphs.slice(pMin, pMax + 1).join(' ')
+      const context = chapter.paragraphs.slice(pMin, pMax + 1).map(item => typeof item === 'string' ? item : (item.content || '')).join(' ')
       onSelectWord({
         word: phrase,
         isPhrase: phrase.trim().split(/\s+/).length > 1,
@@ -1602,7 +1609,7 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
       const dx = e.clientX - start.x
       const dy = e.clientY - start.y
       if (Math.hypot(dx, dy) < 10) {
-        const paraText = chapter.paragraphs[start.p]
+        const paraText = getParaText(start.p)
         const tokens = tokenize(paraText)
         let wi = 0
         for (const t of tokens) {
@@ -1695,7 +1702,9 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
     window.speechSynthesis.cancel()
 
     const allWords = []
-    chapter.paragraphs.forEach((para, pIdx) => {
+    chapter.paragraphs.forEach((item, pIdx) => {
+      const para = typeof item === 'string' ? item : (item.content || '')
+      if (!para) return
       const tokens = tokenize(para)
       let wIdx = 0
       tokens.forEach(t => {
@@ -1707,7 +1716,7 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
     })
 
     setReadingAloud(true)
-    const fullText = chapter.paragraphs.join('\n\n')
+    const fullText = chapter.paragraphs.map(item => typeof item === 'string' ? item : (item.content || '')).join('\n\n')
     const utter = new SpeechSynthesisUtterance(fullText)
     utter.rate = 0.9
     utter.pitch = 1.0
@@ -1809,17 +1818,37 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
           </header>
 
           <div className="reader-text space-y-6" style={{ fontSize: `${fontSize}px` }}>
-            {chapter.paragraphs.map((para, pIdx) => (
-              <Paragraph
-                key={pIdx}
-                text={para}
-                paraIdx={pIdx}
-                speakingWord={speakingWord}
-                bookmarkedWords={bookmarkedWords}
-                range={normalizedRange}
-                selecting={!!phraseSel}
-              />
-            ))}
+            {chapter.paragraphs.map((item, pIdx) => {
+              if (item.type === 'image') {
+                return (
+                  <div key={pIdx} className="flex justify-center my-6">
+                    <img
+                      src={item.src}
+                      alt={item.alt || ''}
+                      className="max-w-full max-h-[60vh] rounded-lg shadow-md"
+                    />
+                  </div>
+                )
+              }
+              if (item.type === 'heading') {
+                return (
+                  <h3 key={pIdx} className="font-serif-cozy text-xl font-semibold text-center mt-8 mb-4">
+                    {item.content}
+                  </h3>
+                )
+              }
+              return (
+                <Paragraph
+                  key={pIdx}
+                  text={item.content || ''}
+                  paraIdx={pIdx}
+                  speakingWord={speakingWord}
+                  bookmarkedWords={bookmarkedWords}
+                  range={normalizedRange}
+                  selecting={!!phraseSel}
+                />
+              )
+            })}
           </div>
 
           <footer className="mt-16 text-center text-muted-foreground/70">
