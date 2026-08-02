@@ -6,15 +6,16 @@ import {
   BookOpen, ArrowLeft, Bookmark, BookmarkCheck, Volume2,
   Play, Pause, Sparkles, Loader2, X, Plus,
   ChevronRight, ChevronLeft, Coffee, Heart, Type, FolderOpen, FileUp, Trash2,
-  Library, Book, Settings2, Star, Flame, Check, Tag, RefreshCw
+  Library, Book, Settings2, Star, Flame, Check, Tag, RefreshCw, List
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { Slider } from '@/components/ui/slider'
 import { Input } from '@/components/ui/input'
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet'
 import { toast } from 'sonner'
 import { SAMPLE_BOOKS } from '@/lib/sample-books'
-import { parseEpub, randomCover } from '@/lib/epub-parser'
+import { parseEpub, randomCover, PARSER_VERSION } from '@/lib/epub-parser'
 import { saveBook, getAllBooks, deleteBook } from '@/lib/library-store'
 import { getWatchConfig, saveWatchConfig, updateKnownFiles, clearWatchConfig, saveDirHandle, getDirHandle } from '@/lib/watch-store'
 import { defineWord, explainPhrase, moreExamples } from '@/lib/fireworks-client'
@@ -69,6 +70,7 @@ function App() {
   const [defCache, setDefCache] = useState({})
   const [selectedWord, setSelectedWord] = useState(null)
   const [userBooks, setUserBooks] = useState([])
+  const userBooksRef = useRef([])
   const [scanning, setScanning] = useState(null) // { total, done, current }
   const [lastBookId, setLastBookId] = useState(null)
   const [bookMeta, setBookMeta] = useState({}) // { bookId: { category, rating, difficulty } }
@@ -86,6 +88,10 @@ function App() {
     return loadLS(STORAGE_KEYS.STATS, { streak: 0, lastReadDate: null, booksStarted: [], todayMinutes: 0, todayDate: today })
   })
   const readingTimerRef = useRef(null)
+
+  useEffect(() => {
+    userBooksRef.current = userBooks
+  }, [userBooks])
 
   useEffect(() => {
     setProgress(loadLS(STORAGE_KEYS.PROGRESS, {}))
@@ -182,6 +188,53 @@ function App() {
     return results
   }
 
+  const upsertParsedBook = async (parsed, folder, existingBooks) => {
+    const key = `${parsed.title.toLowerCase()}|${parsed.author.toLowerCase()}`
+    const titleKey = parsed.title.toLowerCase()
+    const shelfMatch = existingBooks.find(
+      (b) => b.title.toLowerCase() === titleKey &&
+        b.author.toLowerCase() === parsed.author.toLowerCase()
+    ) || existingBooks.find(
+      (b) => b.title.toLowerCase() === titleKey &&
+        (!b.author || b.author === 'Unknown Author' || parsed.author === 'Unknown Author')
+    )
+
+    if (shelfMatch) {
+      const updated = {
+        ...shelfMatch,
+        title: parsed.title,
+        author: parsed.author,
+        category: parsed.category || folder || shelfMatch.category,
+        chapters: parsed.chapters,
+        coverDataUrl: parsed.coverDataUrl || shelfMatch.coverDataUrl || null,
+        parserVersion: parsed.parserVersion || PARSER_VERSION,
+        updatedAt: Date.now(),
+      }
+      await saveBook(updated)
+      importedKeysRef.current.add(key)
+      return { book: updated, mode: 'updated' }
+    }
+
+    if (importedKeysRef.current.has(key)) return null
+
+    importedKeysRef.current.add(key)
+    const id = `user_${crypto.randomUUID()}`
+    const book = {
+      id,
+      title: parsed.title,
+      author: parsed.author,
+      category: parsed.category || folder,
+      coverClass: randomCover(id),
+      coverDataUrl: parsed.coverDataUrl || null,
+      chapters: parsed.chapters,
+      parserVersion: parsed.parserVersion || PARSER_VERSION,
+      addedAt: Date.now(),
+      source: 'user',
+    }
+    await saveBook(book)
+    return { book, mode: 'added' }
+  }
+
   const importFromSource = async (source) => {
     try {
       const files = await collectEpubFiles(source)
@@ -191,35 +244,38 @@ function App() {
       }
       setScanning({ total: files.length, done: 0, current: files[0].file.name })
       const imported = []
+      const updated = []
       for (let i = 0; i < files.length; i++) {
         const { file, folder } = files[i]
         setScanning({ total: files.length, done: i, current: file.name })
         try {
           const parsed = await parseEpub(file, folder)
-          const key = `${parsed.title.toLowerCase()}|${parsed.author.toLowerCase()}`
-          if (importedKeysRef.current.has(key)) continue
-          importedKeysRef.current.add(key)
-          const id = `user_${crypto.randomUUID()}`
-          const book = {
-            id,
-            title: parsed.title,
-            author: parsed.author,
-            category: parsed.category || folder,
-            coverClass: randomCover(id),
-            chapters: parsed.chapters,
-            addedAt: Date.now(),
-            source: 'user',
-          }
-          await saveBook(book)
-          imported.push(book)
+          const result = await upsertParsedBook(parsed, folder, userBooksRef.current)
+          if (!result) continue
+          if (result.mode === 'updated') updated.push(result.book)
+          else imported.push(result.book)
         } catch (e) {
           console.warn('Skipping', file.name, e)
           toast.error(`Could not read "${file.name}"`)
         }
       }
       setScanning(null)
-      setUserBooks(prev => [...prev, ...imported])
-      if (imported.length > 0) toast.success(`Added ${imported.length} book${imported.length !== 1 ? 's' : ''} to your shelf`)
+      if (imported.length > 0 || updated.length > 0) {
+        const merged = [...updated, ...imported]
+        setUserBooks((prev) => {
+          const byId = new Map(prev.map((b) => [b.id, b]))
+          for (const b of merged) byId.set(b.id, b)
+          return Array.from(byId.values())
+        })
+        setActiveBook((prev) => {
+          if (!prev) return prev
+          return merged.find((b) => b.id === prev.id) || prev
+        })
+        const parts = []
+        if (imported.length) parts.push(`added ${imported.length}`)
+        if (updated.length) parts.push(`updated ${updated.length}`)
+        toast.success(`Library ${parts.join(', ')}`)
+      }
     } catch (e) {
       setScanning(null)
       console.error(e)
@@ -301,35 +357,32 @@ function App() {
           setNewBooksDetected(prev => prev + found.length)
           setScanning({ total: found.length, done: 0, current: found[0].file.name })
           const imported = []
+          const updated = []
           for (let i = 0; i < found.length; i++) {
             const { file, folder } = found[i]
             setScanning({ total: found.length, done: i, current: file.name })
             try {
               const parsed = await parseEpub(file, folder)
-              const key = `${parsed.title.toLowerCase()}|${parsed.author.toLowerCase()}`
-              if (importedKeysRef.current.has(key)) continue
-              importedKeysRef.current.add(key)
-              const id = `user_${crypto.randomUUID()}`
-              const book = {
-                id,
-                title: parsed.title,
-                author: parsed.author,
-                category: parsed.category || folder,
-                coverClass: randomCover(id),
-                chapters: parsed.chapters,
-                addedAt: Date.now(),
-                source: 'user',
-              }
-              await saveBook(book)
-              imported.push(book)
+              const result = await upsertParsedBook(parsed, folder, userBooksRef.current || [])
+              if (!result) continue
+              if (result.mode === 'updated') updated.push(result.book)
+              else imported.push(result.book)
             } catch (e) {
               console.warn('Skipping', file.name, e)
             }
           }
           setScanning(null)
-          if (imported.length > 0) {
-            setUserBooks(prev => [...prev, ...imported])
-            toast.success(`Added ${imported.length} new book${imported.length !== 1 ? 's' : ''} from "${handle.name}"`)
+          if (imported.length > 0 || updated.length > 0) {
+            setUserBooks((prev) => {
+              const byId = new Map(prev.map((b) => [b.id, b]))
+              for (const b of updated) byId.set(b.id, b)
+              for (const b of imported) byId.set(b.id, b)
+              return Array.from(byId.values())
+            })
+            const parts = []
+            if (imported.length) parts.push(`added ${imported.length}`)
+            if (updated.length) parts.push(`updated ${updated.length}`)
+            toast.success(`From "${handle.name}": ${parts.join(', ')}`)
           }
         }
       } catch (e) {
@@ -395,29 +448,30 @@ function App() {
             setNewBooksDetected(prev => prev + found.length)
             setScanning({ total: found.length, done: 0, current: found[0].file.name })
             const imported = []
+            const updated = []
             for (let i = 0; i < found.length; i++) {
               const { file, folder } = found[i]
               setScanning({ total: found.length, done: i, current: file.name })
               try {
                 const parsed = await parseEpub(file, folder)
-                const key = `${parsed.title.toLowerCase()}|${parsed.author.toLowerCase()}`
-                if (importedKeysRef.current.has(key)) continue
-                importedKeysRef.current.add(key)
-                const id = `user_${crypto.randomUUID()}`
-                const book = {
-                  id, title: parsed.title, author: parsed.author,
-                  category: parsed.category || folder,
-                  coverClass: randomCover(id), chapters: parsed.chapters,
-                  addedAt: Date.now(), source: 'user',
-                }
-                await saveBook(book)
-                imported.push(book)
+                const result = await upsertParsedBook(parsed, folder, userBooksRef.current)
+                if (!result) continue
+                if (result.mode === 'updated') updated.push(result.book)
+                else imported.push(result.book)
               } catch (e) { console.warn('Skipping', file.name, e) }
             }
             setScanning(null)
-            if (imported.length > 0) {
-              setUserBooks(prev => [...prev, ...imported])
-              toast.success(`Added ${imported.length} new book${imported.length !== 1 ? 's' : ''} from "${watchDirRef.current.name}"`)
+            if (imported.length > 0 || updated.length > 0) {
+              setUserBooks((prev) => {
+                const byId = new Map(prev.map((b) => [b.id, b]))
+                for (const b of updated) byId.set(b.id, b)
+                for (const b of imported) byId.set(b.id, b)
+                return Array.from(byId.values())
+              })
+              const parts = []
+              if (imported.length) parts.push(`added ${imported.length}`)
+              if (updated.length) parts.push(`updated ${updated.length}`)
+              toast.success(`From "${watchDirRef.current.name}": ${parts.join(', ')}`)
             }
           }
         } catch (e) { console.warn('Watch scan error:', e) }
@@ -1353,9 +1407,13 @@ function BookCard({ book, progress, onOpen, onEdit, onRemove }) {
       tabIndex={0}
       className="text-left group focus:outline-none relative cursor-pointer"
     >
-      <div className={`aspect-[2/3] rounded-2xl ${book.coverClass} shadow-md relative overflow-hidden`}>
-        <div className="absolute inset-0 bg-gradient-to-br from-white/10 to-black/20" />
-        <div className="absolute inset-0 p-3 flex flex-col justify-between text-white">
+      <div className={`aspect-[2/3] rounded-2xl ${book.coverDataUrl ? 'bg-muted' : book.coverClass} shadow-md relative overflow-hidden`}>
+        {book.coverDataUrl ? (
+          <img src={book.coverDataUrl} alt="" className="absolute inset-0 w-full h-full object-cover" />
+        ) : (
+          <div className="absolute inset-0 bg-gradient-to-br from-white/10 to-black/20" />
+        )}
+        <div className={`absolute inset-0 p-3 flex flex-col justify-between text-white ${book.coverDataUrl ? 'bg-gradient-to-t from-black/70 via-black/10 to-black/30' : ''}`}>
           <div className="flex items-start justify-between gap-2">
             <div className="text-[10px] uppercase tracking-widest opacity-70 font-medium line-clamp-1">{book.category}</div>
           </div>
@@ -1457,13 +1515,27 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
   const [readingAloud, setReadingAloud] = useState(false)
   const [speakingWord, setSpeakingWord] = useState(null)
   const [phraseSel, setPhraseSel] = useState(null) // { pA, wA, pF, wF }
+  const [tocOpen, setTocOpen] = useState(false)
   const scrollRef = useRef(null)
   const barRef = useRef(null)
   const percentTextRef = useRef(null)
   const longPressTimerRef = useRef(null)
   const pointerStartRef = useRef(null)
-  const chapter = book.chapters[chapterIdx] || book.chapters[0]
+  useEffect(() => {
+    if (chapterIdx >= book.chapters.length) {
+      setChapterIdx(Math.max(0, book.chapters.length - 1))
+    }
+  }, [book.chapters.length, chapterIdx])
+
+  const chapter = book.chapters[Math.min(chapterIdx, book.chapters.length - 1)] || book.chapters[0]
   const hasMultipleChapters = book.chapters.length > 1
+  const chapterLabel = (ch, idx) => {
+    const t = (ch?.title || '').trim()
+    if (!t) return `Chapter ${idx + 1}`
+    if (/^(chapter|part|book|dedication|front matter)\b/i.test(t)) return t
+    if (/^[IVXLCDM]+$/i.test(t) || /^\d+$/.test(t)) return `Chapter ${t}`
+    return t
+  }
 
   // Helper: get text content from paragraph item (handles old string format too)
   const getParaText = useCallback((pIdx) => {
@@ -1776,11 +1848,16 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
             </div>
             <div className="text-[11px] text-muted-foreground mt-0.5">
               {hasMultipleChapters
-                ? `Chapter ${chapterIdx + 1} of ${book.chapters.length}`
-                : (chapter.title?.split(' — ')[0] || 'Chapter 1')} · <span ref={percentTextRef}>{initialPercent}% complete</span>
+                ? `${chapterLabel(chapter, chapterIdx)} · ${chapterIdx + 1}/${book.chapters.length}`
+                : chapterLabel(chapter, 0)} · <span ref={percentTextRef}>{initialPercent}% complete</span>
             </div>
           </div>
           <div className="flex items-center gap-1">
+            {hasMultipleChapters && (
+              <Button variant="ghost" size="icon" onClick={() => setTocOpen(true)} className="rounded-full h-10 w-10 hover:bg-primary/15" aria-label="Table of contents">
+                <List className="w-5 h-5 text-secondary" />
+              </Button>
+            )}
             <Button variant="ghost" size="icon" onClick={() => changeFontSize(-1)} className="rounded-full h-10 w-10 hover:bg-primary/15" aria-label="Smaller text" disabled={fontSize <= 15}>
               <span className="text-secondary font-serif-cozy text-[15px] font-semibold leading-none">A−</span>
             </Button>
@@ -1813,7 +1890,7 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
         >
           <header className="mb-8 text-center">
             <div className="text-[11px] uppercase tracking-widest text-muted-foreground/80">{book.author}</div>
-            <h2 className="font-serif-cozy text-2xl font-semibold mt-1 leading-tight">{chapter.title}</h2>
+            <h2 className="font-serif-cozy text-2xl font-semibold mt-1 leading-tight">{chapterLabel(chapter, chapterIdx)}</h2>
             <div className="mt-4 h-px w-16 bg-primary/50 mx-auto" />
           </header>
 
@@ -1821,16 +1898,19 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
             {chapter.paragraphs.map((item, pIdx) => {
               if (item.type === 'image') {
                 return (
-                  <div key={pIdx} className="flex justify-center my-6">
+                  <figure key={pIdx} className="flex justify-center my-8">
                     <img
                       src={item.src}
                       alt={item.alt || ''}
-                      className="max-w-full max-h-[60vh] rounded-lg shadow-md"
+                      className="max-w-full max-h-[70vh] h-auto object-contain"
+                      loading="lazy"
                     />
-                  </div>
+                  </figure>
                 )
               }
               if (item.type === 'heading') {
+                // Skip duplicate chapter title heading at the start of the chapter body
+                if (pIdx === 0 && cleanHeadingMatch(item.content, chapter.title)) return null
                 return (
                   <h3 key={pIdx} className="font-serif-cozy text-xl font-semibold text-center mt-8 mb-4">
                     {item.content}
@@ -1870,9 +1950,13 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
                 >
                   <ChevronLeft className="w-4 h-4 mr-1" /> Previous
                 </Button>
-                <span className="text-xs text-muted-foreground/80 font-serif-cozy">
+                <button
+                  type="button"
+                  onClick={() => setTocOpen(true)}
+                  className="text-xs text-muted-foreground/80 font-serif-cozy px-2 py-1 rounded-full hover:bg-primary/10"
+                >
                   {chapterIdx + 1} / {book.chapters.length}
-                </span>
+                </button>
                 <Button
                   variant="outline"
                   size="sm"
@@ -1887,8 +1971,46 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
           </footer>
         </article>
       </div>
+
+      <Sheet open={tocOpen} onOpenChange={setTocOpen}>
+        <SheetContent side="left" className="w-[min(100%,22rem)] p-0 flex flex-col">
+          <SheetHeader className="px-5 pt-5 pb-3 border-b border-border/50 text-left">
+            <SheetTitle className="font-serif-cozy text-lg">Contents</SheetTitle>
+            <p className="text-xs text-muted-foreground">{book.chapters.length} chapters · {book.title}</p>
+          </SheetHeader>
+          <div className="flex-1 overflow-y-auto px-2 py-2">
+            {book.chapters.map((ch, idx) => (
+              <button
+                key={`${ch.title}-${idx}`}
+                type="button"
+                onClick={() => {
+                  goToChapter(idx)
+                  setTocOpen(false)
+                }}
+                className={`w-full text-left px-3 py-2.5 rounded-xl transition-colors ${
+                  idx === chapterIdx ? 'bg-primary/15 text-foreground' : 'hover:bg-muted/60 text-foreground/85'
+                }`}
+              >
+                <div className="flex items-baseline gap-3">
+                  <span className="text-[11px] tabular-nums text-muted-foreground w-6 flex-shrink-0">{idx + 1}</span>
+                  <span className="font-serif-cozy text-sm leading-snug">{chapterLabel(ch, idx)}</span>
+                </div>
+              </button>
+            ))}
+          </div>
+        </SheetContent>
+      </Sheet>
     </div>
   )
+}
+
+function cleanHeadingMatch(a, b) {
+  const norm = (s) => cleanTextLike(s).toLowerCase()
+  return norm(a) && norm(a) === norm(b)
+}
+
+function cleanTextLike(t) {
+  return (t || '').replace(/\s+/g, ' ').replace(/\u00a0/g, ' ').trim()
 }
 
 function Paragraph({ text, paraIdx, speakingWord, bookmarkedWords, range, selecting }) {
