@@ -6,10 +6,12 @@ import {
   BookOpen, ArrowLeft, Bookmark, BookmarkCheck, Volume2,
   Play, Pause, Sparkles, Loader2, X, Plus,
   ChevronRight, ChevronLeft, Coffee, Heart, Type, FolderOpen, FileUp, Trash2,
-  Library, Book
+  Library, Book, Settings2, Star, Flame, Check, Tag
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
+import { Slider } from '@/components/ui/slider'
+import { Input } from '@/components/ui/input'
 import { toast } from 'sonner'
 import { SAMPLE_BOOKS } from '@/lib/sample-books'
 import { parseEpub, randomCover } from '@/lib/epub-parser'
@@ -21,6 +23,8 @@ const STORAGE_KEYS = {
   DEF_CACHE: 'cozy_def_cache_v1',
   SETTINGS: 'cozy_settings_v1',
   LAST_BOOK: 'cozy_last_book_v1',
+  BOOK_META: 'cozy_book_meta_v1',
+  CATEGORIES: 'cozy_categories_v1',
 }
 
 // -------------- LocalStorage helpers --------------
@@ -64,18 +68,52 @@ function App() {
   const [userBooks, setUserBooks] = useState([])
   const [scanning, setScanning] = useState(null) // { total, done, current }
   const [lastBookId, setLastBookId] = useState(null)
+  const [bookMeta, setBookMeta] = useState({}) // { bookId: { category, rating, difficulty } }
+  const [customCategories, setCustomCategories] = useState([])
+  const [metaEditingBook, setMetaEditingBook] = useState(null) // book being edited
 
   useEffect(() => {
     setProgress(loadLS(STORAGE_KEYS.PROGRESS, {}))
     setBookmarks(loadLS(STORAGE_KEYS.BOOKMARKS, []))
     setDefCache(loadLS(STORAGE_KEYS.DEF_CACHE, {}))
     setLastBookId(loadLS(STORAGE_KEYS.LAST_BOOK, null))
+    setBookMeta(loadLS(STORAGE_KEYS.BOOK_META, {}))
+    setCustomCategories(loadLS(STORAGE_KEYS.CATEGORIES, []))
     // Load user's imported books from IndexedDB
     getAllBooks().then(books => setUserBooks(books || []))
     // Warm up voices on iOS
     if (typeof window !== 'undefined' && window.speechSynthesis) {
       window.speechSynthesis.getVoices()
     }
+  }, [])
+
+  // Merge original book with user overrides (category/rating/difficulty)
+  const applyMeta = useCallback((book) => {
+    const meta = bookMeta[book.id]
+    if (!meta) return book
+    return { ...book, category: meta.category || book.category, rating: meta.rating, difficulty: meta.difficulty }
+  }, [bookMeta])
+
+  const saveBookMeta = useCallback((bookId, patch) => {
+    setBookMeta(prev => {
+      const next = { ...prev, [bookId]: { ...(prev[bookId] || {}), ...patch } }
+      // Prune empty entries
+      Object.keys(next[bookId]).forEach(k => { if (next[bookId][k] === null || next[bookId][k] === undefined || next[bookId][k] === '') delete next[bookId][k] })
+      if (Object.keys(next[bookId]).length === 0) delete next[bookId]
+      saveLS(STORAGE_KEYS.BOOK_META, next)
+      return next
+    })
+  }, [])
+
+  const addCategory = useCallback((name) => {
+    const trimmed = (name || '').trim()
+    if (!trimmed) return
+    setCustomCategories(prev => {
+      if (prev.some(c => c.toLowerCase() === trimmed.toLowerCase())) return prev
+      const next = [...prev, trimmed]
+      saveLS(STORAGE_KEYS.CATEGORIES, next)
+      return next
+    })
   }, [])
 
   // Collect .epub files from either a DirectoryHandle (Chrome) or FileList (Safari)
@@ -238,7 +276,18 @@ function App() {
     })
   }, [])
 
-  const allBooks = useMemo(() => [...userBooks, ...SAMPLE_BOOKS], [userBooks])
+  const allBooks = useMemo(() => {
+    const raw = [...userBooks, ...SAMPLE_BOOKS]
+    return raw.map(applyMeta)
+  }, [userBooks, applyMeta])
+
+  // All categories present in books (original + overrides) plus custom ones the user created
+  const allCategories = useMemo(() => {
+    const set = new Set()
+    allBooks.forEach(b => set.add(b.category))
+    customCategories.forEach(c => set.add(c))
+    return Array.from(set)
+  }, [allBooks, customCategories])
 
   return (
     <div className="min-h-screen bg-background">
@@ -249,12 +298,12 @@ function App() {
               books={allBooks}
               progress={progress}
               onOpenBook={openBook}
-              onOpenBookmarks={() => setView('bookmarks')}
               bookmarkCount={bookmarks.length}
               onPickDirectory={pickDirectory}
               onPickFiles={pickFiles}
               onRemoveBook={removeUserBook}
               scanning={scanning}
+              onEditMeta={setMetaEditingBook}
             />
           </motion.div>
         )}
@@ -292,6 +341,16 @@ function App() {
         onCache={cacheDef}
         onBookmark={addBookmark}
         bookmarks={bookmarks}
+      />
+
+      <BookMetaSheet
+        book={metaEditingBook}
+        onClose={() => setMetaEditingBook(null)}
+        onSave={(patch) => {
+          if (metaEditingBook) saveBookMeta(metaEditingBook.id, patch)
+        }}
+        allCategories={allCategories}
+        onAddCategory={addCategory}
       />
 
       {/* Bottom nav (hidden while reading for an immersive experience) */}
@@ -367,7 +426,7 @@ function NavTab({ active, onClick, icon, label, badge }) {
 // ============================================================
 // BOOKSHELF VIEW
 // ============================================================
-function BookshelfView({ books, progress, onOpenBook, onOpenBookmarks, bookmarkCount, onPickDirectory, onPickFiles, onRemoveBook, scanning }) {
+function BookshelfView({ books, progress, onOpenBook, bookmarkCount, onPickDirectory, onPickFiles, onRemoveBook, scanning, onEditMeta }) {
   const [showAddSheet, setShowAddSheet] = useState(false)
   const filesInputRef = useRef(null)
   const folderInputRef = useRef(null)
@@ -375,8 +434,9 @@ function BookshelfView({ books, progress, onOpenBook, onOpenBookmarks, bookmarkC
   const grouped = useMemo(() => {
     const g = {}
     books.forEach(b => {
-      if (!g[b.category]) g[b.category] = []
-      g[b.category].push(b)
+      const key = b.category || 'Uncategorized'
+      if (!g[key]) g[key] = []
+      g[key].push(b)
     })
     return g
   }, [books])
@@ -446,6 +506,7 @@ function BookshelfView({ books, progress, onOpenBook, onOpenBookmarks, bookmarkC
                   book={book}
                   progress={progress[book.id]}
                   onOpen={() => onOpenBook(book)}
+                  onEdit={() => onEditMeta(book)}
                   onRemove={book.source === 'user' ? () => onRemoveBook(book.id) : null}
                 />
               ))}
@@ -515,6 +576,238 @@ function BookshelfView({ books, progress, onOpenBook, onOpenBookmarks, bookmarkC
       </AnimatePresence>
     </div>
   )
+}
+
+// ============================================================
+// BOOK META SHEET (category / rating / difficulty)
+// ============================================================
+function BookMetaSheet({ book, onClose, onSave, allCategories, onAddCategory }) {
+  const [category, setCategory] = useState('')
+  const [rating, setRating] = useState(0)
+  const [difficulty, setDifficulty] = useState(1)
+  const [newCat, setNewCat] = useState('')
+  const [showNewCat, setShowNewCat] = useState(false)
+
+  useEffect(() => {
+    if (book) {
+      setCategory(book.category || '')
+      setRating(typeof book.rating === 'number' ? book.rating : 0)
+      setDifficulty(typeof book.difficulty === 'number' ? book.difficulty : 1)
+      setNewCat('')
+      setShowNewCat(false)
+    }
+  }, [book])
+
+  const handleSave = () => {
+    onSave({
+      category: category || null,
+      rating: rating > 0 ? Math.round(rating * 10) / 10 : null,
+      difficulty: difficulty > 0 ? Math.round(difficulty * 10) / 10 : null,
+    })
+    toast.success('Saved')
+    onClose()
+  }
+
+  const handleAddCategory = () => {
+    const t = newCat.trim()
+    if (!t) return
+    onAddCategory(t)
+    setCategory(t)
+    setNewCat('')
+    setShowNewCat(false)
+  }
+
+  return (
+    <AnimatePresence>
+      {book && (
+        <>
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-foreground/25 z-40 backdrop-blur-[2px]"
+            onClick={onClose}
+          />
+          <motion.div
+            initial={{ y: '100%' }}
+            animate={{ y: 0 }}
+            exit={{ y: '100%' }}
+            transition={{ type: 'spring', stiffness: 320, damping: 32 }}
+            drag="y"
+            dragConstraints={{ top: 0, bottom: 0 }}
+            dragElastic={{ top: 0, bottom: 0.3 }}
+            onDragEnd={(_, info) => { if (info.offset.y > 120 || info.velocity.y > 500) onClose() }}
+            className="fixed left-0 right-0 bottom-0 z-50 paper-texture rounded-t-[28px] shadow-2xl border-t border-border/60 safe-bottom max-h-[90vh] flex flex-col"
+          >
+            <div className="pt-2.5 pb-1 grid place-items-center">
+              <div className="w-11 h-1.5 rounded-full bg-muted-foreground/30" />
+            </div>
+
+            <div className="px-6 pt-2 pb-3 flex items-start justify-between gap-3">
+              <div className="min-w-0 flex-1">
+                <div className="text-[11px] uppercase tracking-widest text-muted-foreground/80">Organize book</div>
+                <h3 className="font-serif-cozy text-2xl font-semibold leading-tight mt-0.5 line-clamp-2">{book.title}</h3>
+                <div className="text-xs text-muted-foreground mt-0.5 line-clamp-1">{book.author}</div>
+              </div>
+              <Button variant="ghost" size="icon" onClick={onClose} className="h-9 w-9 rounded-full hover:bg-primary/20 flex-shrink-0" aria-label="Close">
+                <X className="w-4 h-4 text-secondary" />
+              </Button>
+            </div>
+
+            <div className="px-6 pb-6 overflow-y-auto flex-1 space-y-6">
+              {/* Category */}
+              <section>
+                <div className="text-[11px] font-medium uppercase tracking-widest text-muted-foreground/80 mb-2 flex items-center gap-1.5">
+                  <Tag className="w-3 h-3" /> Category
+                </div>
+                <div className="flex flex-wrap gap-2">
+                  {allCategories.map(c => (
+                    <button
+                      key={c}
+                      type="button"
+                      onClick={() => setCategory(c)}
+                      className={`px-3 py-1.5 rounded-full text-xs font-medium border transition-colors ${
+                        category === c
+                          ? 'bg-primary text-primary-foreground border-primary'
+                          : 'bg-card border-border/70 hover:bg-primary/10'
+                      }`}
+                    >
+                      {category === c && <Check className="w-3 h-3 inline mr-1 -mt-0.5" />}
+                      {c}
+                    </button>
+                  ))}
+                  {!showNewCat && (
+                    <button
+                      type="button"
+                      onClick={() => setShowNewCat(true)}
+                      className="px-3 py-1.5 rounded-full text-xs font-medium border border-dashed border-primary/60 text-secondary hover:bg-primary/10 flex items-center gap-1"
+                    >
+                      <Plus className="w-3 h-3" /> New
+                    </button>
+                  )}
+                </div>
+                {showNewCat && (
+                  <div className="mt-3 flex gap-2">
+                    <Input
+                      autoFocus
+                      value={newCat}
+                      onChange={(e) => setNewCat(e.target.value)}
+                      placeholder="e.g. Romance, Historical, Learning..."
+                      onKeyDown={(e) => e.key === 'Enter' && handleAddCategory()}
+                      className="flex-1 rounded-full text-sm h-9"
+                    />
+                    <Button
+                      type="button"
+                      size="sm"
+                      onClick={handleAddCategory}
+                      disabled={!newCat.trim()}
+                      className="rounded-full bg-primary hover:bg-primary/90"
+                    >
+                      Add
+                    </Button>
+                  </div>
+                )}
+              </section>
+
+              {/* Rating slider */}
+              <section>
+                <div className="flex items-center justify-between mb-2">
+                  <div className="text-[11px] font-medium uppercase tracking-widest text-muted-foreground/80 flex items-center gap-1.5">
+                    <Star className="w-3 h-3" /> Your rating
+                  </div>
+                  <div className="flex items-center gap-1.5 text-secondary font-serif-cozy">
+                    <StarRow value={rating} />
+                    <span className="text-lg font-semibold min-w-[40px] text-right">
+                      {rating > 0 ? rating.toFixed(1) : '—'}
+                    </span>
+                  </div>
+                </div>
+                <Slider
+                  min={0}
+                  max={5}
+                  step={0.1}
+                  value={[rating]}
+                  onValueChange={(v) => setRating(v[0])}
+                  className="mt-3"
+                />
+                <div className="flex justify-between text-[10px] text-muted-foreground mt-1.5 font-medium">
+                  <span>0</span><span>1</span><span>2</span><span>3</span><span>4</span><span>5</span>
+                </div>
+              </section>
+
+              {/* Difficulty slider */}
+              <section>
+                <div className="flex items-center justify-between mb-2">
+                  <div className="text-[11px] font-medium uppercase tracking-widest text-muted-foreground/80 flex items-center gap-1.5">
+                    <Flame className="w-3 h-3" /> Difficulty
+                  </div>
+                  <div className="flex items-center gap-1.5 text-secondary font-serif-cozy">
+                    <FlameRow value={difficulty} />
+                    <span className="text-lg font-semibold min-w-[40px] text-right">
+                      {difficulty.toFixed(1)}
+                    </span>
+                  </div>
+                </div>
+                <Slider
+                  min={1}
+                  max={5}
+                  step={0.1}
+                  value={[difficulty]}
+                  onValueChange={(v) => setDifficulty(v[0])}
+                  className="mt-3"
+                />
+                <div className="flex justify-between text-[10px] text-muted-foreground mt-1.5 font-medium">
+                  <span>Very easy</span><span>Easy</span><span>Medium</span><span>Hard</span><span>Very hard</span>
+                </div>
+              </section>
+
+              <Button
+                onClick={handleSave}
+                className="w-full rounded-full bg-secondary hover:bg-secondary/90 text-white h-11 font-medium"
+              >
+                Save changes
+              </Button>
+            </div>
+          </motion.div>
+        </>
+      )}
+    </AnimatePresence>
+  )
+}
+
+// Filled/half/empty stars visualization for rating (0-5, 0.1 precision)
+function StarRow({ value }) {
+  const stars = []
+  for (let i = 1; i <= 5; i++) {
+    let fill = 0
+    if (value >= i) fill = 100
+    else if (value > i - 1) fill = Math.round((value - (i - 1)) * 100)
+    stars.push(
+      <span key={i} className="relative inline-block w-4 h-4">
+        <Star className="absolute inset-0 w-4 h-4 text-muted-foreground/40" />
+        <span className="absolute inset-0 overflow-hidden" style={{ width: `${fill}%` }}>
+          <Star className="w-4 h-4 text-primary fill-primary" />
+        </span>
+      </span>
+    )
+  }
+  return <div className="flex gap-0.5">{stars}</div>
+}
+
+function FlameRow({ value }) {
+  const flames = []
+  for (let i = 1; i <= 5; i++) {
+    let fill = 0
+    if (value >= i) fill = 100
+    else if (value > i - 1) fill = Math.round((value - (i - 1)) * 100)
+    flames.push(
+      <span key={i} className="relative inline-block w-4 h-4">
+        <Flame className="absolute inset-0 w-4 h-4 text-muted-foreground/40" />
+        <span className="absolute inset-0 overflow-hidden" style={{ width: `${fill}%` }}>
+          <Flame className="w-4 h-4 text-primary fill-primary/50" />
+        </span>
+      </span>
+    )
+  }
+  return <div className="flex gap-0.5">{flames}</div>
 }
 
 function AddBooksSheet({ open, onClose, hasFSA, onPickDirectory, onPickFolderInput, onPickFiles }) {
@@ -596,15 +889,21 @@ function AddBooksSheet({ open, onClose, hasFSA, onPickDirectory, onPickFolderInp
   )
 }
 
-function BookCard({ book, progress, onOpen, onRemove }) {
+function BookCard({ book, progress, onOpen, onEdit, onRemove }) {
   const percent = progress?.percent || 0
   const handleRemove = (e) => {
     e.stopPropagation()
     if (confirm(`Remove "${book.title}" from your shelf?`)) onRemove()
   }
+  const handleEdit = (e) => {
+    e.stopPropagation()
+    onEdit()
+  }
   const handleKey = (e) => {
     if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen() }
   }
+  const hasRating = typeof book.rating === 'number'
+  const hasDifficulty = typeof book.difficulty === 'number'
   return (
     <motion.div
       whileTap={{ scale: 0.97 }}
@@ -617,7 +916,9 @@ function BookCard({ book, progress, onOpen, onRemove }) {
       <div className={`aspect-[2/3] rounded-2xl ${book.coverClass} shadow-md relative overflow-hidden`}>
         <div className="absolute inset-0 bg-gradient-to-br from-white/10 to-black/20" />
         <div className="absolute inset-0 p-3 flex flex-col justify-between text-white">
-          <div className="text-[10px] uppercase tracking-widest opacity-70 font-medium">{book.category}</div>
+          <div className="flex items-start justify-between gap-2">
+            <div className="text-[10px] uppercase tracking-widest opacity-70 font-medium line-clamp-1">{book.category}</div>
+          </div>
           <div>
             <div className="font-serif-cozy text-base leading-tight font-semibold drop-shadow line-clamp-3">{book.title}</div>
             <div className="text-[11px] opacity-85 mt-1 line-clamp-1">{book.author}</div>
@@ -629,20 +930,47 @@ function BookCard({ book, progress, onOpen, onRemove }) {
             <div className="h-full bg-primary" style={{ width: `${percent}%` }} />
           </div>
         )}
-        {onRemove && (
+        {/* Top-right action icons */}
+        <div className="absolute top-2 right-2 flex gap-1">
           <button
             type="button"
-            onClick={handleRemove}
-            className="absolute top-2 right-2 w-7 h-7 rounded-full bg-black/40 hover:bg-black/60 grid place-items-center opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
-            aria-label="Remove book"
+            onClick={handleEdit}
+            className="w-7 h-7 rounded-full bg-black/40 hover:bg-black/60 grid place-items-center opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
+            aria-label="Edit book"
           >
-            <Trash2 className="w-3.5 h-3.5 text-white" />
+            <Settings2 className="w-3.5 h-3.5 text-white" />
           </button>
-        )}
+          {onRemove && (
+            <button
+              type="button"
+              onClick={handleRemove}
+              className="w-7 h-7 rounded-full bg-black/40 hover:bg-black/60 grid place-items-center opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
+              aria-label="Remove book"
+            >
+              <Trash2 className="w-3.5 h-3.5 text-white" />
+            </button>
+          )}
+        </div>
       </div>
       <div className="mt-2 px-0.5">
         <div className="text-sm font-medium leading-tight line-clamp-1">{book.title}</div>
-        <div className="text-xs text-muted-foreground mt-0.5">{book.author}</div>
+        <div className="text-xs text-muted-foreground mt-0.5 line-clamp-1">{book.author}</div>
+        {(hasRating || hasDifficulty) && (
+          <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+            {hasRating && (
+              <span className="inline-flex items-center gap-0.5 text-[11px] font-medium text-secondary bg-primary/15 px-1.5 py-0.5 rounded-full">
+                <Star className="w-3 h-3 fill-current" />
+                {book.rating.toFixed(1)}
+              </span>
+            )}
+            {hasDifficulty && (
+              <span className="inline-flex items-center gap-0.5 text-[11px] font-medium text-secondary bg-accent/40 px-1.5 py-0.5 rounded-full">
+                <Flame className="w-3 h-3" />
+                {book.difficulty.toFixed(1)}
+              </span>
+            )}
+          </div>
+        )}
       </div>
     </motion.div>
   )
