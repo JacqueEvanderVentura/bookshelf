@@ -771,8 +771,11 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
             </div>
           </div>
           <div className="flex items-center gap-1">
-            <Button variant="ghost" size="icon" onClick={() => changeFontSize(1)} className="rounded-full h-9 w-9 hover:bg-primary/15" aria-label="Bigger text">
-              <Type className="w-4 h-4 text-secondary" />
+            <Button variant="ghost" size="icon" onClick={() => changeFontSize(-1)} className="rounded-full h-9 w-9 hover:bg-primary/15" aria-label="Smaller text" disabled={fontSize <= 15}>
+              <span className="text-secondary font-serif-cozy text-[13px] font-semibold leading-none">A−</span>
+            </Button>
+            <Button variant="ghost" size="icon" onClick={() => changeFontSize(1)} className="rounded-full h-9 w-9 hover:bg-primary/15" aria-label="Bigger text" disabled={fontSize >= 28}>
+              <span className="text-secondary font-serif-cozy text-[17px] font-semibold leading-none">A+</span>
             </Button>
             <Button
               variant={readingAloud ? 'default' : 'ghost'}
