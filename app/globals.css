@@ -1,0 +1,129 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Cozy warm palette */
+    --background: 36 55% 89%;         /* #F5E6D3 warm cream */
+    --foreground: 25 35% 18%;         /* #3D2C1E dark brown */
+
+    --card: 35 100% 98%;              /* almost white cream */
+    --card-foreground: 25 35% 18%;
+
+    --popover: 35 100% 98%;
+    --popover-foreground: 25 35% 18%;
+
+    --primary: 28 51% 65%;            /* #D4A574 warm terracotta */
+    --primary-foreground: 25 35% 18%;
+
+    --secondary: 27 33% 54%;          /* #B8895C darker terracotta */
+    --secondary-foreground: 35 100% 98%;
+
+    --muted: 34 45% 82%;
+    --muted-foreground: 25 20% 34%;
+
+    --accent: 33 62% 77%;             /* #E8C9A0 soft gold */
+    --accent-foreground: 25 35% 18%;
+
+    --destructive: 0 63% 45%;
+    --destructive-foreground: 35 100% 98%;
+
+    --border: 32 30% 75%;
+    --input: 32 30% 75%;
+    --ring: 28 51% 55%;
+
+    --radius: 1rem;
+
+    --chart-1: 28 51% 65%;
+    --chart-2: 27 33% 54%;
+    --chart-3: 33 62% 77%;
+    --chart-4: 15 45% 50%;
+    --chart-5: 40 55% 70%;
+
+    --sidebar-background: 36 55% 89%;
+    --sidebar-foreground: 25 35% 18%;
+    --sidebar-primary: 28 51% 65%;
+    --sidebar-primary-foreground: 25 35% 18%;
+    --sidebar-accent: 33 62% 77%;
+    --sidebar-accent-foreground: 25 35% 18%;
+    --sidebar-border: 32 30% 75%;
+    --sidebar-ring: 28 51% 55%;
+  }
+}
+
+@layer base {
+  * { @apply border-border; }
+  body {
+    @apply bg-background text-foreground;
+    font-family: var(--font-inter), -apple-system, BlinkMacSystemFont, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -webkit-tap-highlight-color: transparent;
+    overscroll-behavior: none;
+  }
+  .font-serif-cozy {
+    font-family: var(--font-fraunces), Georgia, 'Times New Roman', serif;
+  }
+  .reader-text {
+    font-family: var(--font-fraunces), Georgia, serif;
+    font-size: 20px;
+    line-height: 1.85;
+    letter-spacing: 0.005em;
+    color: hsl(25 35% 18%);
+  }
+}
+
+/* Custom scrollbars - warm & subtle */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb {
+  background: hsl(28 40% 70% / 0.5);
+  border-radius: 999px;
+}
+
+/* Book cover gradients */
+.cover-gradient-1 { background: linear-gradient(135deg, #8b4a6b 0%, #a26588 100%); }
+.cover-gradient-2 { background: linear-gradient(135deg, #5a7d5a 0%, #7fa07f 100%); }
+.cover-gradient-3 { background: linear-gradient(135deg, #b8895c 0%, #d4a574 100%); }
+.cover-gradient-4 { background: linear-gradient(135deg, #4a5d7d 0%, #6a80a2 100%); }
+.cover-gradient-5 { background: linear-gradient(135deg, #7d5a4a 0%, #a2806a 100%); }
+.cover-gradient-6 { background: linear-gradient(135deg, #5d4a7d 0%, #806aa2 100%); }
+
+/* Word tap animation */
+@keyframes wordPop {
+  0% { transform: scale(1); }
+  50% { transform: scale(1.08); }
+  100% { transform: scale(1); }
+}
+.word-selected {
+  background: linear-gradient(180deg, transparent 60%, hsl(33 80% 75%) 60%);
+  border-radius: 4px;
+  animation: wordPop 0.3s ease;
+}
+.word-speaking {
+  background: linear-gradient(180deg, transparent 50%, hsl(28 70% 68%) 50%);
+  border-radius: 4px;
+}
+
+/* Cozy paper texture on cards */
+.paper-texture {
+  background-color: hsl(35 100% 98%);
+  background-image:
+    radial-gradient(ellipse at top left, hsl(35 60% 92%) 0%, transparent 50%),
+    radial-gradient(ellipse at bottom right, hsl(30 50% 90%) 0%, transparent 50%);
+}
+
+/* Safe area for iPhone notch */
+.safe-top { padding-top: max(env(safe-area-inset-top), 1rem); }
+.safe-bottom { padding-bottom: max(env(safe-area-inset-bottom), 1rem); }
+
+/* Prevent text selection during word tap */
+.reader-text .word {
+  cursor: pointer;
+  padding: 0 1px;
+  border-radius: 3px;
+  transition: background-color 0.15s;
+}
+.reader-text .word:active {
+  background-color: hsl(33 62% 82%);
+}
