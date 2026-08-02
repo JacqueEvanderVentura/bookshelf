@@ -5,12 +5,14 @@ import { motion, AnimatePresence } from 'framer-motion'
 import {
   BookOpen, ArrowLeft, Bookmark, BookmarkCheck, Volume2,
   Play, Pause, Sparkles, Loader2, X, Plus,
-  ChevronRight, Coffee, Heart, Type
+  ChevronRight, ChevronLeft, Coffee, Heart, Type, FolderOpen, FileUp, Trash2
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
 import { toast } from 'sonner'
 import { SAMPLE_BOOKS } from '@/lib/sample-books'
+import { parseEpub, randomCover } from '@/lib/epub-parser'
+import { saveBook, getAllBooks, deleteBook } from '@/lib/library-store'
 
 const STORAGE_KEYS = {
   PROGRESS: 'cozy_progress_v1',
@@ -57,16 +59,116 @@ function App() {
   const [bookmarks, setBookmarks] = useState([])
   const [defCache, setDefCache] = useState({})
   const [selectedWord, setSelectedWord] = useState(null)
+  const [userBooks, setUserBooks] = useState([])
+  const [scanning, setScanning] = useState(null) // { total, done, current }
 
   useEffect(() => {
     setProgress(loadLS(STORAGE_KEYS.PROGRESS, {}))
     setBookmarks(loadLS(STORAGE_KEYS.BOOKMARKS, []))
     setDefCache(loadLS(STORAGE_KEYS.DEF_CACHE, {}))
+    // Load user's imported books from IndexedDB
+    getAllBooks().then(books => setUserBooks(books || []))
     // Warm up voices on iOS
     if (typeof window !== 'undefined' && window.speechSynthesis) {
       window.speechSynthesis.getVoices()
     }
   }, [])
+
+  // Collect .epub files from either a DirectoryHandle (Chrome) or FileList (Safari)
+  const collectEpubFiles = async (source) => {
+    const results = []
+    if (source instanceof FileList || Array.isArray(source)) {
+      for (const f of source) {
+        if (/\.epub$/i.test(f.name)) {
+          // Try to derive folder name from webkitRelativePath (from webkitdirectory input)
+          const rel = f.webkitRelativePath || ''
+          const parts = rel.split('/')
+          const folder = parts.length >= 2 ? parts[parts.length - 2] : 'My Books'
+          results.push({ file: f, folder })
+        }
+      }
+      return results
+    }
+    // Directory handle (File System Access API) — recursive scan
+    async function walk(dirHandle, path = '') {
+      for await (const entry of dirHandle.values()) {
+        if (entry.kind === 'file' && /\.epub$/i.test(entry.name)) {
+          const file = await entry.getFile()
+          const folder = path.split('/').pop() || dirHandle.name || 'My Books'
+          results.push({ file, folder })
+        } else if (entry.kind === 'directory') {
+          await walk(entry, path ? `${path}/${entry.name}` : entry.name)
+        }
+      }
+    }
+    await walk(source)
+    return results
+  }
+
+  const importFromSource = async (source) => {
+    try {
+      const files = await collectEpubFiles(source)
+      if (files.length === 0) {
+        toast.error('No .epub files found in that folder')
+        return
+      }
+      setScanning({ total: files.length, done: 0, current: files[0].file.name })
+      const imported = []
+      for (let i = 0; i < files.length; i++) {
+        const { file, folder } = files[i]
+        setScanning({ total: files.length, done: i, current: file.name })
+        try {
+          const parsed = await parseEpub(file, folder)
+          const id = `user_${crypto.randomUUID()}`
+          const book = {
+            id,
+            title: parsed.title,
+            author: parsed.author,
+            category: parsed.category || folder,
+            coverClass: randomCover(id),
+            chapters: parsed.chapters,
+            addedAt: Date.now(),
+            source: 'user',
+          }
+          await saveBook(book)
+          imported.push(book)
+        } catch (e) {
+          console.warn('Skipping', file.name, e)
+          toast.error(`Could not read "${file.name}"`)
+        }
+      }
+      setScanning(null)
+      setUserBooks(prev => [...prev, ...imported])
+      if (imported.length > 0) toast.success(`Added ${imported.length} book${imported.length !== 1 ? 's' : ''} to your shelf`)
+    } catch (e) {
+      setScanning(null)
+      console.error(e)
+      toast.error('Import failed: ' + (e.message || 'unknown'))
+    }
+  }
+
+  const pickDirectory = async () => {
+    if (typeof window === 'undefined' || !window.showDirectoryPicker) {
+      toast.error('Folder picker not supported on this browser. Use "Pick files" instead.')
+      return
+    }
+    try {
+      const handle = await window.showDirectoryPicker({ mode: 'read' })
+      await importFromSource(handle)
+    } catch (e) {
+      if (e.name !== 'AbortError') toast.error('Could not open folder')
+    }
+  }
+
+  const pickFiles = (files) => {
+    if (files && files.length) importFromSource(files)
+  }
+
+  const removeUserBook = async (id) => {
+    await deleteBook(id)
+    setUserBooks(prev => prev.filter(b => b.id !== id))
+    toast.success('Book removed')
+  }
 
   const openBook = (book) => {
     setActiveBook(book)
@@ -112,16 +214,23 @@ function App() {
     })
   }, [])
 
+  const allBooks = useMemo(() => [...userBooks, ...SAMPLE_BOOKS], [userBooks])
+
   return (
     <div className="min-h-screen bg-background">
       <AnimatePresence mode="wait">
         {view === 'shelf' && (
           <motion.div key="shelf" initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}>
             <BookshelfView
+              books={allBooks}
               progress={progress}
               onOpenBook={openBook}
               onOpenBookmarks={() => setView('bookmarks')}
               bookmarkCount={bookmarks.length}
+              onPickDirectory={pickDirectory}
+              onPickFiles={pickFiles}
+              onRemoveBook={removeUserBook}
+              scanning={scanning}
             />
           </motion.div>
         )}
@@ -144,7 +253,7 @@ function App() {
               onBack={() => setView('shelf')}
               onRemove={removeBookmark}
               onOpenBook={(bookId) => {
-                const book = SAMPLE_BOOKS.find(b => b.id === bookId)
+                const book = allBooks.find(b => b.id === bookId)
                 if (book) openBook(book)
               }}
             />
@@ -167,23 +276,29 @@ function App() {
 // ============================================================
 // BOOKSHELF VIEW
 // ============================================================
-function BookshelfView({ progress, onOpenBook, onOpenBookmarks, bookmarkCount }) {
+function BookshelfView({ books, progress, onOpenBook, onOpenBookmarks, bookmarkCount, onPickDirectory, onPickFiles, onRemoveBook, scanning }) {
+  const [showAddSheet, setShowAddSheet] = useState(false)
+  const filesInputRef = useRef(null)
+  const folderInputRef = useRef(null)
+
   const grouped = useMemo(() => {
     const g = {}
-    SAMPLE_BOOKS.forEach(b => {
+    books.forEach(b => {
       if (!g[b.category]) g[b.category] = []
       g[b.category].push(b)
     })
     return g
-  }, [])
+  }, [books])
 
   const continueReading = useMemo(() => {
     return Object.entries(progress)
-      .map(([id, p]) => ({ book: SAMPLE_BOOKS.find(b => b.id === id), progress: p }))
+      .map(([id, p]) => ({ book: books.find(b => b.id === id), progress: p }))
       .filter(x => x.book)
       .sort((a, b) => (b.progress.lastRead || 0) - (a.progress.lastRead || 0))
       .slice(0, 3)
-  }, [progress])
+  }, [progress, books])
+
+  const hasFSA = typeof window !== 'undefined' && !!window.showDirectoryPicker
 
   return (
     <div className="min-h-screen">
@@ -200,20 +315,31 @@ function BookshelfView({ progress, onOpenBook, onOpenBookmarks, bookmarkCount })
               </p>
             </div>
           </div>
-          <Button
-            variant="ghost"
-            size="icon"
-            className="rounded-full h-11 w-11 hover:bg-primary/15 relative"
-            onClick={onOpenBookmarks}
-            aria-label="Bookmarks"
-          >
-            <Bookmark className="w-5 h-5 text-secondary" />
-            {bookmarkCount > 0 && (
-              <span className="absolute -top-0.5 -right-0.5 bg-secondary text-white text-[10px] font-semibold rounded-full min-w-[18px] h-[18px] px-1 grid place-items-center">
-                {bookmarkCount > 99 ? '99+' : bookmarkCount}
-              </span>
-            )}
-          </Button>
+          <div className="flex items-center gap-1">
+            <Button
+              variant="ghost"
+              size="icon"
+              className="rounded-full h-11 w-11 hover:bg-primary/15"
+              onClick={() => setShowAddSheet(true)}
+              aria-label="Add books"
+            >
+              <Plus className="w-5 h-5 text-secondary" />
+            </Button>
+            <Button
+              variant="ghost"
+              size="icon"
+              className="rounded-full h-11 w-11 hover:bg-primary/15 relative"
+              onClick={onOpenBookmarks}
+              aria-label="Bookmarks"
+            >
+              <Bookmark className="w-5 h-5 text-secondary" />
+              {bookmarkCount > 0 && (
+                <span className="absolute -top-0.5 -right-0.5 bg-secondary text-white text-[10px] font-semibold rounded-full min-w-[18px] h-[18px] px-1 grid place-items-center">
+                  {bookmarkCount > 99 ? '99+' : bookmarkCount}
+                </span>
+              )}
+            </Button>
+          </div>
         </div>
       </header>
 
@@ -231,14 +357,20 @@ function BookshelfView({ progress, onOpenBook, onOpenBookmarks, bookmarkCount })
           </section>
         )}
 
-        {Object.entries(grouped).map(([category, books]) => (
+        {Object.entries(grouped).map(([category, categoryBooks]) => (
           <section key={category} className="mb-8">
             <h2 className="font-serif-cozy text-sm font-medium text-muted-foreground uppercase tracking-widest mb-4 px-1">
               {category}
             </h2>
             <div className="grid grid-cols-2 sm:grid-cols-3 md:grid-cols-4 gap-4">
-              {books.map(book => (
-                <BookCard key={book.id} book={book} progress={progress[book.id]} onOpen={() => onOpenBook(book)} />
+              {categoryBooks.map(book => (
+                <BookCard
+                  key={book.id}
+                  book={book}
+                  progress={progress[book.id]}
+                  onOpen={() => onOpenBook(book)}
+                  onRemove={book.source === 'user' ? () => onRemoveBook(book.id) : null}
+                />
               ))}
             </div>
           </section>
@@ -249,25 +381,161 @@ function BookshelfView({ progress, onOpenBook, onOpenBookmarks, bookmarkCount })
           <p className="font-serif-cozy italic text-sm">Tap any word while reading to discover its meaning.</p>
         </div>
       </main>
+
+      {/* Hidden inputs for file/folder pickers */}
+      <input
+        ref={filesInputRef}
+        type="file"
+        accept=".epub,application/epub+zip"
+        multiple
+        style={{ display: 'none' }}
+        onChange={(e) => { onPickFiles(e.target.files); e.target.value = ''; setShowAddSheet(false) }}
+      />
+      <input
+        ref={folderInputRef}
+        type="file"
+        multiple
+        webkitdirectory=""
+        directory=""
+        style={{ display: 'none' }}
+        onChange={(e) => { onPickFiles(e.target.files); e.target.value = ''; setShowAddSheet(false) }}
+      />
+
+      {/* Add books sheet */}
+      <AddBooksSheet
+        open={showAddSheet}
+        onClose={() => setShowAddSheet(false)}
+        hasFSA={hasFSA}
+        onPickDirectory={() => { setShowAddSheet(false); onPickDirectory() }}
+        onPickFolderInput={() => folderInputRef.current?.click()}
+        onPickFiles={() => filesInputRef.current?.click()}
+      />
+
+      {/* Scanning overlay */}
+      <AnimatePresence>
+        {scanning && (
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-foreground/40 z-50 grid place-items-center backdrop-blur-sm"
+          >
+            <Card className="paper-texture border border-border/60 rounded-2xl p-6 shadow-2xl max-w-xs w-[85%]">
+              <div className="flex items-center gap-3">
+                <Loader2 className="w-5 h-5 animate-spin text-primary" />
+                <div className="flex-1 min-w-0">
+                  <div className="font-serif-cozy text-sm font-semibold">Reading your books...</div>
+                  <div className="text-[11px] text-muted-foreground mt-0.5 truncate">{scanning.current}</div>
+                </div>
+              </div>
+              <div className="mt-3 h-1.5 bg-muted rounded-full overflow-hidden">
+                <div className="h-full bg-primary transition-all" style={{ width: `${(scanning.done / scanning.total) * 100}%` }} />
+              </div>
+              <div className="text-[11px] text-muted-foreground mt-1.5">{scanning.done} of {scanning.total}</div>
+            </Card>
+          </motion.div>
+        )}
+      </AnimatePresence>
     </div>
   )
 }
 
-function BookCard({ book, progress, onOpen }) {
+function AddBooksSheet({ open, onClose, hasFSA, onPickDirectory, onPickFolderInput, onPickFiles }) {
+  return (
+    <AnimatePresence>
+      {open && (
+        <>
+          <motion.div
+            initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+            className="fixed inset-0 bg-foreground/25 z-40 backdrop-blur-[2px]"
+            onClick={onClose}
+          />
+          <motion.div
+            initial={{ y: '100%' }}
+            animate={{ y: 0 }}
+            exit={{ y: '100%' }}
+            transition={{ type: 'spring', stiffness: 320, damping: 32 }}
+            className="fixed left-0 right-0 bottom-0 z-50 paper-texture rounded-t-[28px] shadow-2xl border-t border-border/60 safe-bottom"
+          >
+            <div className="pt-2.5 pb-1 grid place-items-center">
+              <div className="w-11 h-1.5 rounded-full bg-muted-foreground/30" />
+            </div>
+            <div className="px-6 pt-3 pb-8">
+              <h2 className="font-serif-cozy text-2xl font-semibold leading-tight">Add your books</h2>
+              <p className="text-sm text-muted-foreground mt-1">Where do you keep your <span className="font-medium">.epub</span> files?</p>
+
+              <div className="mt-5 space-y-2.5">
+                {hasFSA && (
+                  <button
+                    onClick={onPickDirectory}
+                    className="w-full flex items-center gap-4 px-4 py-4 rounded-2xl border border-border bg-card hover:bg-primary/10 transition-colors text-left"
+                  >
+                    <div className="w-11 h-11 rounded-full bg-primary/20 grid place-items-center flex-shrink-0">
+                      <FolderOpen className="w-5 h-5 text-secondary" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="font-serif-cozy text-base font-semibold leading-tight">Choose a folder</div>
+                      <div className="text-xs text-muted-foreground mt-0.5">We&apos;ll scan it (and subfolders) for books</div>
+                    </div>
+                  </button>
+                )}
+                {!hasFSA && (
+                  <button
+                    onClick={onPickFolderInput}
+                    className="w-full flex items-center gap-4 px-4 py-4 rounded-2xl border border-border bg-card hover:bg-primary/10 transition-colors text-left"
+                  >
+                    <div className="w-11 h-11 rounded-full bg-primary/20 grid place-items-center flex-shrink-0">
+                      <FolderOpen className="w-5 h-5 text-secondary" />
+                    </div>
+                    <div className="min-w-0">
+                      <div className="font-serif-cozy text-base font-semibold leading-tight">Choose a folder</div>
+                      <div className="text-xs text-muted-foreground mt-0.5">Desktop only — books group by subfolder</div>
+                    </div>
+                  </button>
+                )}
+
+                <button
+                  onClick={onPickFiles}
+                  className="w-full flex items-center gap-4 px-4 py-4 rounded-2xl border border-border bg-card hover:bg-primary/10 transition-colors text-left"
+                >
+                  <div className="w-11 h-11 rounded-full bg-primary/20 grid place-items-center flex-shrink-0">
+                    <FileUp className="w-5 h-5 text-secondary" />
+                  </div>
+                  <div className="min-w-0">
+                    <div className="font-serif-cozy text-base font-semibold leading-tight">Pick individual files</div>
+                    <div className="text-xs text-muted-foreground mt-0.5">Best on iPhone and iPad — tap to select .epub files</div>
+                  </div>
+                </button>
+              </div>
+
+              <p className="text-[11px] text-muted-foreground/80 mt-5 font-serif-cozy italic text-center">
+                Your books stay on this device — nothing gets uploaded.
+              </p>
+            </div>
+          </motion.div>
+        </>
+      )}
+    </AnimatePresence>
+  )
+}
+
+function BookCard({ book, progress, onOpen, onRemove }) {
   const percent = progress?.percent || 0
+  const handleRemove = (e) => {
+    e.stopPropagation()
+    if (confirm(`Remove "${book.title}" from your shelf?`)) onRemove()
+  }
   return (
     <motion.button
       whileTap={{ scale: 0.97 }}
       onClick={onOpen}
-      className="text-left group focus:outline-none"
+      className="text-left group focus:outline-none relative"
     >
       <div className={`aspect-[2/3] rounded-2xl ${book.coverClass} shadow-md relative overflow-hidden`}>
         <div className="absolute inset-0 bg-gradient-to-br from-white/10 to-black/20" />
         <div className="absolute inset-0 p-3 flex flex-col justify-between text-white">
           <div className="text-[10px] uppercase tracking-widest opacity-70 font-medium">{book.category}</div>
           <div>
-            <div className="font-serif-cozy text-base leading-tight font-semibold drop-shadow">{book.title}</div>
-            <div className="text-[11px] opacity-85 mt-1">{book.author}</div>
+            <div className="font-serif-cozy text-base leading-tight font-semibold drop-shadow line-clamp-3">{book.title}</div>
+            <div className="text-[11px] opacity-85 mt-1 line-clamp-1">{book.author}</div>
           </div>
         </div>
         <div className="absolute left-0 top-0 bottom-0 w-1.5 bg-black/25" />
@@ -275,6 +543,15 @@ function BookCard({ book, progress, onOpen }) {
           <div className="absolute bottom-0 left-0 right-0 h-1 bg-black/20">
             <div className="h-full bg-primary" style={{ width: `${percent}%` }} />
           </div>
+        )}
+        {onRemove && (
+          <button
+            onClick={handleRemove}
+            className="absolute top-2 right-2 w-7 h-7 rounded-full bg-black/40 hover:bg-black/60 grid place-items-center opacity-0 group-hover:opacity-100 transition-opacity"
+            aria-label="Remove book"
+          >
+            <Trash2 className="w-3.5 h-3.5 text-white" />
+          </button>
         )}
       </div>
       <div className="mt-2 px-0.5">
@@ -318,14 +595,26 @@ function ContinueCard({ book, progress, onOpen }) {
 // READER VIEW
 // ============================================================
 function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, bookmarks }) {
-  const [chapterIdx] = useState(progress?.chapter || 0)
+  const [chapterIdx, setChapterIdx] = useState(progress?.chapter || 0)
   const [fontSize, setFontSize] = useState(loadLS(STORAGE_KEYS.SETTINGS, {})?.fontSize || 20)
   const [readingAloud, setReadingAloud] = useState(false)
   const [speakingWord, setSpeakingWord] = useState(null)
   const scrollRef = useRef(null)
-  const barRef = useRef(null)         // Direct DOM ref for progress bar
-  const percentTextRef = useRef(null) // Direct DOM ref for "% complete" text
-  const chapter = book.chapters[chapterIdx]
+  const barRef = useRef(null)
+  const percentTextRef = useRef(null)
+  const chapter = book.chapters[chapterIdx] || book.chapters[0]
+  const hasMultipleChapters = book.chapters.length > 1
+
+  const goToChapter = useCallback((newIdx) => {
+    if (newIdx < 0 || newIdx >= book.chapters.length) return
+    // Stop TTS
+    if (typeof window !== 'undefined' && window.speechSynthesis) window.speechSynthesis.cancel()
+    setReadingAloud(false)
+    setSpeakingWord(null)
+    setChapterIdx(newIdx)
+    if (scrollRef.current) scrollRef.current.scrollTop = 0
+    onUpdateProgress({ chapter: newIdx, scroll: 0, percent: 0 })
+  }, [book.chapters.length, onUpdateProgress])
 
   const bookmarkedWords = useMemo(() => {
     return new Set(bookmarks.filter(b => b.bookId === book.id).map(b => b.word.toLowerCase()))
@@ -467,7 +756,9 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
               {book.title}
             </div>
             <div className="text-[11px] text-muted-foreground mt-0.5">
-              {chapter.title.split(' — ')[0]} · <span ref={percentTextRef}>{initialPercent}% complete</span>
+              {hasMultipleChapters
+                ? `Chapter ${chapterIdx + 1} of ${book.chapters.length}`
+                : (chapter.title?.split(' — ')[0] || 'Chapter 1')} · <span ref={percentTextRef}>{initialPercent}% complete</span>
             </div>
           </div>
           <div className="flex items-center gap-1">
@@ -517,7 +808,33 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
               <Sparkles className="w-3.5 h-3.5" />
               <div className="h-px w-8 bg-primary/40" />
             </div>
-            <p className="font-serif-cozy italic text-sm mt-3">End of excerpt</p>
+            <p className="font-serif-cozy italic text-sm mt-3">End of chapter</p>
+
+            {hasMultipleChapters && (
+              <div className="mt-6 flex items-center justify-center gap-3">
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => goToChapter(chapterIdx - 1)}
+                  disabled={chapterIdx === 0}
+                  className="rounded-full border-primary/40 hover:bg-primary/10"
+                >
+                  <ChevronLeft className="w-4 h-4 mr-1" /> Previous
+                </Button>
+                <span className="text-xs text-muted-foreground/80 font-serif-cozy">
+                  {chapterIdx + 1} / {book.chapters.length}
+                </span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => goToChapter(chapterIdx + 1)}
+                  disabled={chapterIdx >= book.chapters.length - 1}
+                  className="rounded-full border-primary/40 hover:bg-primary/10"
+                >
+                  Next <ChevronRight className="w-4 h-4 ml-1" />
+                </Button>
+              </div>
+            )}
           </footer>
         </article>
       </div>
