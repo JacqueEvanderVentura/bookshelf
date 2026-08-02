@@ -2,11 +2,12 @@ import { NextResponse } from 'next/server'
 
 const FIREWORKS_URL = 'https://api.fireworks.ai/inference/v1/chat/completions'
 
-// Cheapest capable models (fallback chain if one fails)
+// Cheapest capable models available on this Fireworks account (fallback chain)
 const MODEL_CHAIN = [
-  'accounts/fireworks/models/llama-v3p1-8b-instruct',
-  'accounts/fireworks/models/mixtral-8x7b-instruct',
-  'accounts/fireworks/models/llama-v3p3-70b-instruct',
+  'accounts/fireworks/models/deepseek-v4-flash',
+  'accounts/fireworks/models/deepseek-v4-flash-0731',
+  'accounts/fireworks/routers/glm-5p2-fast',
+  'accounts/fireworks/models/gpt-oss-120b',
 ]
 
 async function callFireworks(word, context) {
