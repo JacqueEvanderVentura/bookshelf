@@ -322,6 +322,7 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
   const [fontSize, setFontSize] = useState(loadLS(STORAGE_KEYS.SETTINGS, {})?.fontSize || 20)
   const [readingAloud, setReadingAloud] = useState(false)
   const [speakingWord, setSpeakingWord] = useState(null)
+  const [livePercent, setLivePercent] = useState(progress?.percent || 0)
   const scrollRef = useRef(null)
   const chapter = book.chapters[chapterIdx]
 
@@ -338,17 +339,33 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
   useEffect(() => {
     const el = scrollRef.current
     if (!el) return
+    let rafId = null
     let timer
     const onScroll = () => {
+      // Live update via requestAnimationFrame (no throttle for UI)
+      if (rafId) return
+      rafId = requestAnimationFrame(() => {
+        rafId = null
+        const total = el.scrollHeight - el.clientHeight
+        const percent = total > 0 ? Math.min(100, (el.scrollTop / total) * 100) : 0
+        setLivePercent(percent)
+      })
+      // Debounce persistent save separately
       clearTimeout(timer)
       timer = setTimeout(() => {
         const total = el.scrollHeight - el.clientHeight
         const percent = total > 0 ? Math.min(100, Math.round((el.scrollTop / total) * 100)) : 0
         onUpdateProgress({ chapter: chapterIdx, scroll: el.scrollTop, percent })
-      }, 350)
+      }, 400)
     }
     el.addEventListener('scroll', onScroll, { passive: true })
-    return () => { el.removeEventListener('scroll', onScroll); clearTimeout(timer) }
+    // Initial calc
+    onScroll()
+    return () => {
+      el.removeEventListener('scroll', onScroll)
+      clearTimeout(timer)
+      if (rafId) cancelAnimationFrame(rafId)
+    }
   }, [chapterIdx, onUpdateProgress])
 
   const startReadAloud = useCallback(() => {
@@ -406,7 +423,7 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
 
   useEffect(() => () => { if (typeof window !== 'undefined' && window.speechSynthesis) window.speechSynthesis.cancel() }, [])
 
-  const percent = progress?.percent || 0
+  const percent = Math.round(livePercent)
 
   const handleWordTap = (word, paraIdx, wordIdx, paraText) => {
     onSelectWord({
@@ -458,7 +475,7 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
           </div>
         </div>
         <div className="mt-2.5 h-0.5 bg-muted/60 rounded-full overflow-hidden">
-          <div className="h-full bg-primary transition-all" style={{ width: `${percent}%` }} />
+          <div className="h-full bg-primary" style={{ width: `${percent}%` }} />
         </div>
       </header>
 
