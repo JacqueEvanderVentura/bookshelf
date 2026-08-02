@@ -2,6 +2,10 @@ import { NextResponse } from 'next/server'
 
 export const dynamic = 'force-static'
 
+export function generateStaticParams() {
+  return [{ path: [] }]
+}
+
 const FIREWORKS_URL = 'https://api.fireworks.ai/inference/v1/chat/completions'
 
 // Cheapest capable models available on this Fireworks account (fallback chain)
