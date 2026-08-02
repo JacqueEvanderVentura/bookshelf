@@ -1084,8 +1084,8 @@ function BookMetaSheet({ book, onClose, onSave, allCategories, onAddCategory }) 
                 <h3 className="font-serif-cozy text-2xl font-semibold leading-tight mt-0.5 line-clamp-2">{book.title}</h3>
                 <div className="text-xs text-muted-foreground mt-0.5 line-clamp-1">{book.author}</div>
               </div>
-              <Button variant="ghost" size="icon" onClick={onClose} className="h-9 w-9 rounded-full hover:bg-primary/20 flex-shrink-0" aria-label="Close">
-                <X className="w-4 h-4 text-secondary" />
+              <Button variant="ghost" size="icon" onClick={onClose} className="h-10 w-10 rounded-full hover:bg-primary/20 flex-shrink-0" aria-label="Close">
+                <X className="w-5 h-5 text-secondary" />
               </Button>
             </div>
 
@@ -1375,19 +1375,19 @@ function BookCard({ book, progress, onOpen, onEdit, onRemove }) {
           <button
             type="button"
             onClick={handleEdit}
-            className="w-7 h-7 rounded-full bg-black/40 hover:bg-black/60 grid place-items-center opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
-            aria-label="Edit book"
-          >
-            <Settings2 className="w-3.5 h-3.5 text-white" />
+              className="w-10 h-10 rounded-full bg-black/40 hover:bg-black/60 grid place-items-center opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
+              aria-label="Edit book"
+            >
+              <Settings2 className="w-5 h-5 text-white" />
           </button>
           {onRemove && (
             <button
               type="button"
               onClick={handleRemove}
-              className="w-7 h-7 rounded-full bg-black/40 hover:bg-black/60 grid place-items-center opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
+              className="w-10 h-10 rounded-full bg-black/40 hover:bg-black/60 grid place-items-center opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
               aria-label="Remove book"
             >
-              <Trash2 className="w-3.5 h-3.5 text-white" />
+              <Trash2 className="w-5 h-5 text-white" />
             </button>
           )}
         </div>
@@ -1772,11 +1772,11 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
             </div>
           </div>
           <div className="flex items-center gap-1">
-            <Button variant="ghost" size="icon" onClick={() => changeFontSize(-1)} className="rounded-full h-9 w-9 hover:bg-primary/15" aria-label="Smaller text" disabled={fontSize <= 15}>
-              <span className="text-secondary font-serif-cozy text-[13px] font-semibold leading-none">A−</span>
+            <Button variant="ghost" size="icon" onClick={() => changeFontSize(-1)} className="rounded-full h-10 w-10 hover:bg-primary/15" aria-label="Smaller text" disabled={fontSize <= 15}>
+              <span className="text-secondary font-serif-cozy text-[15px] font-semibold leading-none">A−</span>
             </Button>
-            <Button variant="ghost" size="icon" onClick={() => changeFontSize(1)} className="rounded-full h-9 w-9 hover:bg-primary/15" aria-label="Bigger text" disabled={fontSize >= 28}>
-              <span className="text-secondary font-serif-cozy text-[17px] font-semibold leading-none">A+</span>
+            <Button variant="ghost" size="icon" onClick={() => changeFontSize(1)} className="rounded-full h-10 w-10 hover:bg-primary/15" aria-label="Bigger text" disabled={fontSize >= 28}>
+              <span className="text-secondary font-serif-cozy text-[19px] font-semibold leading-none">A+</span>
             </Button>
             <Button
               variant={readingAloud ? 'default' : 'ghost'}
@@ -1785,7 +1785,7 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
               className={`rounded-full h-10 w-10 ${readingAloud ? 'bg-primary text-primary-foreground hover:bg-primary/90' : 'hover:bg-primary/15'}`}
               aria-label={readingAloud ? 'Stop reading' : 'Read aloud'}
             >
-              {readingAloud ? <Pause className="w-4 h-4" /> : <Play className="w-4 h-4 text-secondary" />}
+              {readingAloud ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5 text-secondary" />}
             </Button>
           </div>
         </div>
@@ -2040,11 +2040,11 @@ function DefinitionPanel({ selection, onClose, cache, onCache, onBookmark, bookm
                   </h3>
                   <Button
                     variant="ghost" size="icon"
-                    className="h-9 w-9 rounded-full hover:bg-primary/20 flex-shrink-0 -mt-0.5"
+                    className="h-10 w-10 rounded-full hover:bg-primary/20 flex-shrink-0 -mt-0.5"
                     onClick={() => speak(displayText)}
                     aria-label={isPhraseMode ? 'Read phrase' : 'Pronounce word'}
                   >
-                    <Volume2 className="w-4 h-4 text-secondary" />
+                    <Volume2 className="w-5 h-5 text-secondary" />
                   </Button>
                 </div>
                 {def && (
@@ -2139,10 +2139,10 @@ function ExampleRow({ text, onPlay }) {
       <Button
         variant="ghost" size="icon"
         onClick={onPlay}
-        className="h-8 w-8 rounded-full hover:bg-primary/20 flex-shrink-0 mt-0.5"
+        className="h-10 w-10 rounded-full hover:bg-primary/20 flex-shrink-0 mt-0.5"
         aria-label="Play example"
       >
-        <Volume2 className="w-3.5 h-3.5 text-secondary" />
+        <Volume2 className="w-5 h-5 text-secondary" />
       </Button>
       <p className="font-serif-cozy text-[15px] leading-relaxed text-foreground/90 pt-0.5">{text}</p>
     </div>
@@ -2206,8 +2206,8 @@ function BookmarkCard({ bookmark, onRemove, onOpen }) {
             <h3 className={`font-serif-cozy font-semibold leading-tight ${isPhrase ? 'text-lg' : 'text-2xl capitalize'}`}>
               {isPhrase ? `“${bookmark.word}”` : bookmark.word}
             </h3>
-            <Button variant="ghost" size="icon" onClick={speak} className="h-7 w-7 rounded-full hover:bg-primary/15 flex-shrink-0 mt-0.5">
-              <Volume2 className="w-3.5 h-3.5 text-secondary" />
+            <Button variant="ghost" size="icon" onClick={speak} className="h-10 w-10 rounded-full hover:bg-primary/15 flex-shrink-0 mt-0.5">
+              <Volume2 className="w-5 h-5 text-secondary" />
             </Button>
           </div>
           <div className="text-xs text-muted-foreground mt-1.5 flex items-center gap-2 flex-wrap">
@@ -2219,8 +2219,8 @@ function BookmarkCard({ bookmark, onRemove, onOpen }) {
             <p className="text-xs mt-1.5 text-muted-foreground italic leading-relaxed">Literally: {bookmark.literal}</p>
           )}
         </div>
-        <Button variant="ghost" size="icon" onClick={onRemove} className="h-8 w-8 rounded-full hover:bg-destructive/15 flex-shrink-0">
-          <X className="w-4 h-4 text-muted-foreground" />
+        <Button variant="ghost" size="icon" onClick={onRemove} className="h-10 w-10 rounded-full hover:bg-destructive/15 flex-shrink-0">
+          <X className="w-5 h-5 text-muted-foreground" />
         </Button>
       </div>
       <button onClick={onOpen} className="mt-3 pt-3 border-t border-border/50 w-full text-left flex items-center justify-between text-xs text-muted-foreground hover:text-foreground transition">
