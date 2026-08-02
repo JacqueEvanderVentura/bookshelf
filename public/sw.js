@@ -1,6 +1,6 @@
-/* Auto-stamped on deploy. Do not hand-edit __BUILD_ID__. */
+/* Auto-stamped on deploy — placeholder below is replaced by scripts/stamp-sw.js */
 const BUILD_ID = '__BUILD_ID__'
-const CACHE = `bookshelf-${BUILD_ID}`
+const CACHE = 'bookshelf-__BUILD_ID__'
 
 self.addEventListener('install', (event) => {
   event.waitUntil(

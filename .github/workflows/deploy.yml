@@ -37,10 +37,14 @@ jobs:
         run: |
           test -f out/sw.js
           test -f out/build-id.txt
-          BUILD_ID=$(cat out/build-id.txt | tr -d '\n')
+          BUILD_ID=$(tr -d '[:space:]' < out/build-id.txt)
           echo "PWA build id: $BUILD_ID"
-          grep -q "bookshelf-${BUILD_ID}" out/sw.js
-          ! grep -q '__BUILD_ID__' out/sw.js
+          grep -q "const BUILD_ID = '${BUILD_ID}'" out/sw.js
+          grep -q "const CACHE = 'bookshelf-${BUILD_ID}'" out/sw.js
+          if grep -q '__BUILD_ID__' out/sw.js; then
+            echo "ERROR: placeholder __BUILD_ID__ still present in out/sw.js"
+            exit 1
+          fi
 
       - uses: actions/upload-pages-artifact@v3
         with:
