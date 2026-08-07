@@ -32,6 +32,9 @@ jobs:
           GITHUB_PAGES: 'true'
           GITHUB_SHA: ${{ github.sha }}
           NEXT_PUBLIC_FIREWORKS_API_KEY: ${{ secrets.FIREWORKS_API_KEY }}
+          # Baked into the client bundle at build time (required for GH Pages static export)
+          NEXT_PUBLIC_ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+          NEXT_PUBLIC_ELEVENLABS_VOICE_ID: ${{ secrets.ELEVENLABS_VOICE_ID }}
 
       - name: Verify service worker was stamped
         run: |
