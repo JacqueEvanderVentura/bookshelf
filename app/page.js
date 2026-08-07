@@ -6,7 +6,8 @@ import {
   BookOpen, ArrowLeft, Bookmark, BookmarkCheck, Volume2,
   Play, Pause, Sparkles, Loader2, X, Plus,
   ChevronRight, ChevronLeft, Coffee, Heart, Type, FolderOpen, FileUp, Trash2,
-  Library, Book, Settings2, Star, Flame, Check, Tag, RefreshCw, List
+  Library, Book, Settings2, Star, Flame, Check, Tag, RefreshCw, List,
+  Compass, Square, Ear
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Card } from '@/components/ui/card'
@@ -19,6 +20,9 @@ import { parseEpub, randomCover, PARSER_VERSION } from '@/lib/epub-parser'
 import { saveBook, getAllBooks, deleteBook } from '@/lib/library-store'
 import { getWatchConfig, saveWatchConfig, updateKnownFiles, clearWatchConfig, saveDirHandle, getDirHandle } from '@/lib/watch-store'
 import { defineWord, explainPhrase, moreExamples } from '@/lib/fireworks-client'
+import { createNarrator, pickFallbackVoice, SPEED_OPTIONS } from '@/lib/narrator'
+import { clearElevenLabsDisabled } from '@/lib/elevenlabs-client'
+import ExploreView from '@/components/explore-view'
 
 const STORAGE_KEYS = {
   PROGRESS: 'cozy_progress_v1',
@@ -59,16 +63,57 @@ function tokenize(text) {
   return parts
 }
 
+function normalizePhraseRange(sel) {
+  if (!sel) return null
+  const { pA, wA, pF, wF } = sel
+  if (pF < pA || (pF === pA && wF < wA)) return { pMin: pF, wMin: wF, pMax: pA, wMax: wA }
+  return { pMin: pA, wMin: wA, pMax: pF, wMax: wF }
+}
+
+function wordInPhraseRange(p, w, range) {
+  if (!range) return false
+  const { pMin, wMin, pMax, wMax } = range
+  if (p < pMin || p > pMax) return false
+  if (p === pMin && p === pMax) return w >= wMin && w <= wMax
+  if (p === pMin) return w >= wMin
+  if (p === pMax) return w <= wMax
+  return true
+}
+
+/** Paint phrase highlight via DOM so React doesn't re-render (and break pointer capture) on every move. */
+function paintPhraseHighlight(root, sel) {
+  if (!root) return
+  const range = normalizePhraseRange(sel)
+  root.querySelectorAll('[data-p][data-w]').forEach((el) => {
+    const p = parseInt(el.dataset.p, 10)
+    const w = parseInt(el.dataset.w, 10)
+    if (wordInPhraseRange(p, w, range)) el.setAttribute('data-phrase-on', '1')
+    else el.removeAttribute('data-phrase-on')
+  })
+  root.querySelectorAll('[data-phrase-space]').forEach((el) => {
+    const p = parseInt(el.dataset.p, 10)
+    const wBefore = parseInt(el.dataset.wBefore, 10)
+    const on =
+      range &&
+      wordInPhraseRange(p, wBefore, range) &&
+      wordInPhraseRange(p, wBefore + 1, range)
+    if (on) el.setAttribute('data-phrase-on', '1')
+    else el.removeAttribute('data-phrase-on')
+  })
+}
+
 // ============================================================
 // MAIN APP
 // ============================================================
 function App() {
-  const [view, setView] = useState('shelf') // shelf | reader | bookmarks
+  const [view, setView] = useState('shelf') // shelf | reader | bookmarks | explore
   const [activeBook, setActiveBook] = useState(null)
   const [progress, setProgress] = useState({})
   const [bookmarks, setBookmarks] = useState([])
   const [defCache, setDefCache] = useState({})
   const [selectedWord, setSelectedWord] = useState(null)
+  const [narrateRequest, setNarrateRequest] = useState(null) // { chapterIdx, paraIdx, wordIdx }
+  const narrateApiRef = useRef(null)
   const [userBooks, setUserBooks] = useState([])
   const userBooksRef = useRef([])
   const [scanning, setScanning] = useState(null) // { total, done, current }
@@ -644,6 +689,9 @@ function App() {
               onClose={closeBook}
               onSelectWord={setSelectedWord}
               bookmarks={bookmarks}
+              narrateRequest={narrateRequest}
+              onNarrateRequestHandled={() => setNarrateRequest(null)}
+              narrateApiRef={narrateApiRef}
             />
           </motion.div>
         )}
@@ -660,6 +708,33 @@ function App() {
             />
           </motion.div>
         )}
+        {view === 'explore' && (
+          <motion.div key="explore" initial={{ opacity: 0, y: 16 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0 }}>
+            <ExploreView
+              existingBooks={userBooks}
+              onImported={async ({ parsed, difficulty }) => {
+                const result = await upsertParsedBook(parsed, 'Gutenberg', userBooksRef.current)
+                if (!result) {
+                  toast.message('Already on your shelf')
+                  return
+                }
+                const book = result.book
+                setUserBooks((prev) => {
+                  const byId = new Map(prev.map((b) => [b.id, b]))
+                  byId.set(book.id, book)
+                  return Array.from(byId.values())
+                })
+                if (typeof difficulty === 'number') {
+                  saveBookMeta(book.id, {
+                    category: 'Gutenberg',
+                    difficulty,
+                    rating: bookMeta[book.id]?.rating ?? null,
+                  })
+                }
+              }}
+            />
+          </motion.div>
+        )}
       </AnimatePresence>
 
       <DefinitionPanel
@@ -669,6 +744,18 @@ function App() {
         onCache={cacheDef}
         onBookmark={addBookmark}
         bookmarks={bookmarks}
+        onReadFromHere={(sel) => {
+          const chapterIdx = sel.chapterIdx ?? 0
+          const paraIdx = sel.paraIdx ?? 0
+          const wordIdx = sel.wordIdx ?? 0
+          // Start narration BEFORE closing the panel (same user gesture). Closing the panel
+          // must not tear down the narrator (see ReaderView effect deps).
+          const played = narrateApiRef.current?.playFromPosition?.(chapterIdx, paraIdx, wordIdx)
+          if (!played) {
+            setNarrateRequest({ chapterIdx, paraIdx, wordIdx, nonce: Date.now() })
+          }
+          setSelectedWord(null)
+        }}
       />
 
       <BookMetaSheet
@@ -690,6 +777,7 @@ function App() {
           onGoShelf={() => setView('shelf')}
           onGoRead={goToReader}
           onGoBookmarks={() => setView('bookmarks')}
+          onGoExplore={() => setView('explore')}
           hasLastBook={!!lastBookId || Object.keys(progress).length > 0}
           bookmarkCount={bookmarks.length}
         />
@@ -780,27 +868,33 @@ function AddFab({ onPickDirectory, onPickFiles }) {
   )
 }
 
-function BottomNav({ current, onGoShelf, onGoRead, onGoBookmarks, hasLastBook, bookmarkCount }) {
+function BottomNav({ current, onGoShelf, onGoRead, onGoBookmarks, onGoExplore, hasLastBook, bookmarkCount }) {
   return (
     <nav className="fixed bottom-0 left-0 right-0 z-30 safe-bottom border-t border-border/60 bg-background/95 backdrop-blur-md">
-      <div className="max-w-md mx-auto flex items-stretch justify-around px-2 pt-1.5 pb-1">
+      <div className="max-w-md mx-auto flex items-stretch justify-around px-1 pt-1 pb-1">
         <NavTab
           active={current === 'shelf'}
           onClick={onGoShelf}
-          icon={<Library className="w-5 h-5" strokeWidth={2.2} />}
+          icon={<Library className="w-6 h-6" strokeWidth={2.2} />}
           label="Bookshelf"
         />
         <NavTab
           active={current === 'reader'}
           onClick={onGoRead}
-          icon={<Book className="w-5 h-5" strokeWidth={2.2} />}
-          label={hasLastBook ? 'Read' : 'Start Reading'}
+          icon={<Book className="w-6 h-6" strokeWidth={2.2} />}
+          label={hasLastBook ? 'Read' : 'Start'}
+        />
+        <NavTab
+          active={current === 'explore'}
+          onClick={onGoExplore}
+          icon={<Compass className="w-6 h-6" strokeWidth={2.2} />}
+          label="Explore"
         />
         <NavTab
           active={current === 'bookmarks'}
           onClick={onGoBookmarks}
-          icon={<Bookmark className="w-5 h-5" strokeWidth={2.2} />}
-          label="Bookmarks"
+          icon={<Bookmark className="w-6 h-6" strokeWidth={2.2} />}
+          label="Words"
           badge={bookmarkCount > 0 ? bookmarkCount : null}
         />
       </div>
@@ -812,7 +906,7 @@ function NavTab({ active, onClick, icon, label, badge }) {
   return (
     <button
       onClick={onClick}
-      className={`flex-1 flex flex-col items-center justify-center gap-0.5 py-1.5 px-2 rounded-xl transition-colors relative ${
+      className={`flex-1 flex flex-col items-center justify-center gap-0.5 min-h-[52px] py-2 px-1 rounded-xl transition-colors relative ${
         active ? 'text-secondary' : 'text-muted-foreground hover:text-foreground'
       }`}
     >
@@ -1138,7 +1232,7 @@ function BookMetaSheet({ book, onClose, onSave, allCategories, onAddCategory }) 
                 <h3 className="font-serif-cozy text-2xl font-semibold leading-tight mt-0.5 line-clamp-2">{book.title}</h3>
                 <div className="text-xs text-muted-foreground mt-0.5 line-clamp-1">{book.author}</div>
               </div>
-              <Button variant="ghost" size="icon" onClick={onClose} className="h-10 w-10 rounded-full hover:bg-primary/20 flex-shrink-0" aria-label="Close">
+              <Button variant="ghost" size="icon" onClick={onClose} className="h-12 w-12 rounded-full hover:bg-primary/20 flex-shrink-0" aria-label="Close">
                 <X className="w-5 h-5 text-secondary" />
               </Button>
             </div>
@@ -1433,19 +1527,19 @@ function BookCard({ book, progress, onOpen, onEdit, onRemove }) {
           <button
             type="button"
             onClick={handleEdit}
-              className="w-10 h-10 rounded-full bg-black/40 hover:bg-black/60 grid place-items-center opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
+              className="w-12 h-12 rounded-full bg-black/40 hover:bg-black/60 grid place-items-center opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
               aria-label="Edit book"
             >
-              <Settings2 className="w-5 h-5 text-white" />
+              <Settings2 className="w-6 h-6 text-white" />
           </button>
           {onRemove && (
             <button
               type="button"
               onClick={handleRemove}
-              className="w-10 h-10 rounded-full bg-black/40 hover:bg-black/60 grid place-items-center opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
+              className="w-12 h-12 rounded-full bg-black/40 hover:bg-black/60 grid place-items-center opacity-0 group-hover:opacity-100 focus:opacity-100 transition-opacity"
               aria-label="Remove book"
             >
-              <Trash2 className="w-5 h-5 text-white" />
+              <Trash2 className="w-6 h-6 text-white" />
             </button>
           )}
         </div>
@@ -1509,18 +1603,35 @@ function ContinueCard({ book, progress, onOpen }) {
 // ============================================================
 // READER VIEW
 // ============================================================
-function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, bookmarks }) {
+function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, bookmarks, narrateRequest, onNarrateRequestHandled, narrateApiRef }) {
   const [chapterIdx, setChapterIdx] = useState(progress?.chapter || 0)
   const [fontSize, setFontSize] = useState(loadLS(STORAGE_KEYS.SETTINGS, {})?.fontSize || 20)
-  const [readingAloud, setReadingAloud] = useState(false)
+  const [voiceRate, setVoiceRate] = useState(() => {
+    const r = loadLS(STORAGE_KEYS.SETTINGS, {})?.voiceRate
+    return SPEED_OPTIONS.includes(r) ? r : 1
+  })
+  const [player, setPlayer] = useState({ playing: false, paused: false, loading: false, visible: false, wordIndex: 0, totalWords: 0, provider: 'webspeech', rate: 1 })
   const [speakingWord, setSpeakingWord] = useState(null)
-  const [phraseSel, setPhraseSel] = useState(null) // { pA, wA, pF, wF }
+  const [selecting, setSelecting] = useState(false) // phrase drag active (highlights painted via DOM)
   const [tocOpen, setTocOpen] = useState(false)
   const scrollRef = useRef(null)
+  const articleRef = useRef(null)
   const barRef = useRef(null)
   const percentTextRef = useRef(null)
   const longPressTimerRef = useRef(null)
   const pointerStartRef = useRef(null)
+  const phraseSelRef = useRef(null) // { pA, wA, pF, wF } during drag — avoid React re-renders
+  const autoScrollRafRef = useRef(null)
+  const lastPointerYRef = useRef(0)
+  const suppressClickRef = useRef(false)
+  const narratorRef = useRef(null)
+  const chapterIdxRef = useRef(chapterIdx)
+  chapterIdxRef.current = chapterIdx
+  const onUpdateProgressRef = useRef(onUpdateProgress)
+  onUpdateProgressRef.current = onUpdateProgress
+  const preparingVoice = !!player.loading
+  const readingAloud = player.playing && !player.paused && !preparingVoice
+  const playerVisible = player.visible
   useEffect(() => {
     if (chapterIdx >= book.chapters.length) {
       setChapterIdx(Math.max(0, book.chapters.length - 1))
@@ -1545,24 +1656,30 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
   }, [chapter.paragraphs])
 
   // Cleanup long-press timer on unmount / chapter change
-  useEffect(() => () => { if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current) }, [])
+  useEffect(() => () => {
+    if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current)
+    if (autoScrollRafRef.current) cancelAnimationFrame(autoScrollRafRef.current)
+  }, [])
 
-  const normalizedRange = useMemo(() => {
-    if (!phraseSel) return null
-    const { pA, wA, pF, wF } = phraseSel
-    if (pF < pA || (pF === pA && wF < wA)) return { pMin: pF, wMin: wF, pMax: pA, wMax: wA }
-    return { pMin: pA, wMin: wA, pMax: pF, wMax: wF }
-  }, [phraseSel])
+  const clearPhraseUi = useCallback(() => {
+    phraseSelRef.current = null
+    setSelecting(false)
+    paintPhraseHighlight(articleRef.current, null)
+    if (scrollRef.current) scrollRef.current.style.touchAction = ''
+    if (autoScrollRafRef.current) {
+      cancelAnimationFrame(autoScrollRafRef.current)
+      autoScrollRafRef.current = null
+    }
+  }, [])
 
   const finalizePhrase = useCallback(() => {
-    if (!phraseSel) return
-    const range = (() => {
-      const { pA, wA, pF, wF } = phraseSel
-      if (pF < pA || (pF === pA && wF < wA)) return { pMin: pF, wMin: wF, pMax: pA, wMax: wA }
-      return { pMin: pA, wMin: wA, pMax: pF, wMax: wF }
-    })()
-    // Build phrase text from range
-    const { pMin, wMin, pMax, wMax } = range
+    const phraseSel = phraseSelRef.current
+    if (!phraseSel) {
+      clearPhraseUi()
+      return
+    }
+    const range = normalizePhraseRange(phraseSel)
+    const { pMin, wMin, pMax } = range
     const outParts = []
     for (let p = pMin; p <= pMax; p++) {
       const tokens = tokenize(getParaText(p))
@@ -1572,16 +1689,11 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
       let ended = false
       for (const t of tokens) {
         if (t.type === 'word') {
-          const inRange =
-            (p === pMin && p === pMax && wi >= wMin && wi <= wMax) ||
-            (p === pMin && p !== pMax && wi >= wMin) ||
-            (p > pMin && p < pMax) ||
-            (p === pMax && p !== pMin && wi <= wMax)
+          const inRange = wordInPhraseRange(p, wi, range)
           if (inRange) {
             text += t.text
             started = true
           } else if (started) {
-            // Once we pass the last in-range word for this paragraph, stop
             ended = true
           }
           wi++
@@ -1589,16 +1701,15 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
           text += t.text
         }
       }
-      // Trim trailing punctuation/spaces
       outParts.push(text.replace(/[\s,;:.\-—–]+$/u, '').trim())
     }
     const phrase = outParts.filter(Boolean).join(' ')
-    setPhraseSel(null)
-    // Restore scroll
-    if (scrollRef.current) scrollRef.current.style.touchAction = ''
-    // Trigger panel
+    clearPhraseUi()
     if (phrase && phrase.length > 0) {
-      const context = chapter.paragraphs.slice(pMin, pMax + 1).map(item => typeof item === 'string' ? item : (item.content || '')).join(' ')
+      const context = chapter.paragraphs
+        .slice(pMin, pMax + 1)
+        .map((item) => (typeof item === 'string' ? item : (item.content || '')))
+        .join(' ')
       onSelectWord({
         word: phrase,
         isPhrase: phrase.trim().split(/\s+/).length > 1,
@@ -1606,112 +1717,205 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
         bookId: book.id,
         bookTitle: book.title,
         chapterIdx,
+        // Always the first word of the selection — "Read from here" starts here
         paraIdx: pMin,
         wordIdx: wMin,
       })
     }
-  }, [phraseSel, chapter, book, chapterIdx, onSelectWord])
+  }, [clearPhraseUi, getParaText, chapter, book, chapterIdx, onSelectWord])
 
-  const cancelSelection = useCallback(() => {
-    if (longPressTimerRef.current) { clearTimeout(longPressTimerRef.current); longPressTimerRef.current = null }
-    pointerStartRef.current = null
-    setPhraseSel(null)
-    if (scrollRef.current) scrollRef.current.style.touchAction = ''
+  const updatePhraseFocus = useCallback((pF, wF, clientY) => {
+    const cur = phraseSelRef.current
+    if (!cur) return
+    if (pF !== cur.pF || wF !== cur.wF) {
+      phraseSelRef.current = { ...cur, pF, wF }
+      paintPhraseHighlight(articleRef.current, phraseSelRef.current)
+    }
+    if (clientY != null) lastPointerYRef.current = clientY
   }, [])
 
-  // Pointer handlers on the article
+  const runEdgeAutoScroll = useCallback(() => {
+    autoScrollRafRef.current = null
+    if (!phraseSelRef.current) return
+    const el = scrollRef.current
+    if (!el) return
+    const y = lastPointerYRef.current
+    const rect = el.getBoundingClientRect()
+    const edge = 64
+    let dy = 0
+    if (y < rect.top + edge) dy = -Math.max(8, (rect.top + edge - y) * 0.35)
+    else if (y > rect.bottom - edge) dy = Math.max(8, (y - (rect.bottom - edge)) * 0.35)
+    if (dy !== 0) {
+      el.scrollTop += dy
+      // Re-hit-test under finger after scroll
+      const under = document.elementFromPoint(
+        pointerStartRef.current?.lastX ?? rect.left + rect.width / 2,
+        y
+      )
+      const wordEl = under?.closest?.('[data-p][data-w]')
+      if (wordEl) {
+        updatePhraseFocus(
+          parseInt(wordEl.dataset.p, 10),
+          parseInt(wordEl.dataset.w, 10),
+          y
+        )
+      }
+      autoScrollRafRef.current = requestAnimationFrame(runEdgeAutoScroll)
+    }
+  }, [updatePhraseFocus])
+
+  // Block native scroll/gestures while selecting (non-passive)
+  useEffect(() => {
+    const el = scrollRef.current
+    if (!el || !selecting) return
+    const block = (e) => { e.preventDefault() }
+    el.addEventListener('touchmove', block, { passive: false })
+    return () => el.removeEventListener('touchmove', block)
+  }, [selecting])
+
+  // Pointer handlers on the article.
+  // Mobile taps often jitter >10px. Cancelling long-press must NOT block opening
+  // the definition panel, and we only suppress the click fallback when we already
+  // handled the gesture (opened a word / finished a phrase).
   const handlePointerDown = useCallback((e) => {
-    // Only left button / touch
-    if (e.button !== undefined && e.button !== 0) return
+    // Only left button / touch / pen
+    if (e.pointerType === 'mouse' && e.button !== 0) return
     const wordEl = e.target.closest?.('[data-p][data-w]')
     if (!wordEl) return
     const p = parseInt(wordEl.dataset.p, 10)
     const w = parseInt(wordEl.dataset.w, 10)
-    pointerStartRef.current = { x: e.clientX, y: e.clientY, p, w, pointerId: e.pointerId }
+    pointerStartRef.current = {
+      x: e.clientX,
+      y: e.clientY,
+      lastX: e.clientX,
+      lastY: e.clientY,
+      p,
+      w,
+      pointerId: e.pointerId,
+      scrolled: false,
+    }
     if (longPressTimerRef.current) clearTimeout(longPressTimerRef.current)
     longPressTimerRef.current = setTimeout(() => {
       longPressTimerRef.current = null
-      setPhraseSel({ pA: p, wA: w, pF: p, wF: w })
-      // Disable scroll during selection
+      if (!pointerStartRef.current || pointerStartRef.current.scrolled) return
+      const start = pointerStartRef.current
+      phraseSelRef.current = { pA: start.p, wA: start.w, pF: start.p, wF: start.w }
+      setSelecting(true)
+      paintPhraseHighlight(articleRef.current, phraseSelRef.current)
       if (scrollRef.current) scrollRef.current.style.touchAction = 'none'
-      // Haptic feedback if available
       if (typeof navigator !== 'undefined' && navigator.vibrate) navigator.vibrate(15)
-      // Capture pointer so future move events land on this element
-      try { wordEl.setPointerCapture?.(pointerStartRef.current.pointerId) } catch {}
-    }, 380)
+      // Capture on the article (stable) — not the word span (React may replace it)
+      try { articleRef.current?.setPointerCapture?.(start.pointerId) } catch {}
+    }, 420)
   }, [])
 
   const handlePointerMove = useCallback((e) => {
-    // If timer still pending and finger moved > 10px, treat as scroll → cancel long press
-    if (longPressTimerRef.current && pointerStartRef.current) {
-      const dx = e.clientX - pointerStartRef.current.x
-      const dy = e.clientY - pointerStartRef.current.y
-      if (Math.hypot(dx, dy) > 10) {
-        clearTimeout(longPressTimerRef.current)
-        longPressTimerRef.current = null
-      }
+    const LONG_PRESS_CANCEL = 12
+    const TAP_SLOP = 22
+    const start = pointerStartRef.current
+    if (!start) return
+    start.lastX = e.clientX
+    start.lastY = e.clientY
+    lastPointerYRef.current = e.clientY
+    const dx = e.clientX - start.x
+    const dy = e.clientY - start.y
+    const dist = Math.hypot(dx, dy)
+
+    if (longPressTimerRef.current && dist > LONG_PRESS_CANCEL) {
+      clearTimeout(longPressTimerRef.current)
+      longPressTimerRef.current = null
     }
-    // Track drag during selection
-    if (phraseSel) {
+    if (dist > TAP_SLOP && !phraseSelRef.current) {
+      start.scrolled = true
+    }
+
+    if (phraseSelRef.current) {
       e.preventDefault?.()
       const el = document.elementFromPoint(e.clientX, e.clientY)
       const wordEl = el?.closest?.('[data-p][data-w]')
       if (wordEl) {
-        const pF = parseInt(wordEl.dataset.p, 10)
-        const wF = parseInt(wordEl.dataset.w, 10)
-        if (pF !== phraseSel.pF || wF !== phraseSel.wF) {
-          setPhraseSel(prev => ({ ...prev, pF, wF }))
-        }
+        updatePhraseFocus(
+          parseInt(wordEl.dataset.p, 10),
+          parseInt(wordEl.dataset.w, 10),
+          e.clientY
+        )
+      } else {
+        lastPointerYRef.current = e.clientY
+      }
+      if (!autoScrollRafRef.current) {
+        autoScrollRafRef.current = requestAnimationFrame(runEdgeAutoScroll)
       }
     }
-  }, [phraseSel])
+  }, [updatePhraseFocus, runEdgeAutoScroll])
+
+  const openWordAt = useCallback((paraIdx, wordIdx) => {
+    const paraText = getParaText(paraIdx)
+    const tokens = tokenize(paraText)
+    let wi = 0
+    for (const t of tokens) {
+      if (t.type === 'word') {
+        if (wi === wordIdx) {
+          onSelectWord({
+            word: t.text,
+            context: paraText,
+            bookId: book.id,
+            bookTitle: book.title,
+            chapterIdx,
+            paraIdx,
+            wordIdx,
+          })
+          return
+        }
+        wi++
+      }
+    }
+  }, [getParaText, onSelectWord, book.id, book.title, chapterIdx])
 
   const handlePointerUp = useCallback((e) => {
-    const wasSelecting = !!phraseSel
-    const timerWasPending = !!longPressTimerRef.current
+    const TAP_SLOP = 22
+    const wasSelecting = !!phraseSelRef.current
+    const start = pointerStartRef.current
     if (longPressTimerRef.current) {
       clearTimeout(longPressTimerRef.current)
       longPressTimerRef.current = null
     }
+    try { articleRef.current?.releasePointerCapture?.(e.pointerId) } catch {}
+
+    let handled = false
     if (wasSelecting) {
       finalizePhrase()
-    } else if (timerWasPending && pointerStartRef.current) {
-      // Short tap on a word — trigger single-word define
-      const start = pointerStartRef.current
-      const dx = e.clientX - start.x
-      const dy = e.clientY - start.y
-      if (Math.hypot(dx, dy) < 10) {
-        const paraText = getParaText(start.p)
-        const tokens = tokenize(paraText)
-        let wi = 0
-        for (const t of tokens) {
-          if (t.type === 'word') {
-            if (wi === start.w) {
-              onSelectWord({
-                word: t.text,
-                context: paraText,
-                bookId: book.id,
-                bookTitle: book.title,
-                chapterIdx,
-                paraIdx: start.p,
-                wordIdx: start.w,
-              })
-              break
-            }
-            wi++
-          }
-        }
+      handled = true
+    } else if (start && !start.scrolled) {
+      const dx = (e.clientX ?? start.x) - start.x
+      const dy = (e.clientY ?? start.y) - start.y
+      if (Math.hypot(dx, dy) <= TAP_SLOP) {
+        openWordAt(start.p, start.w)
+        handled = true
       }
     }
+
+    if (handled) {
+      suppressClickRef.current = true
+      setTimeout(() => { suppressClickRef.current = false }, 450)
+    }
     pointerStartRef.current = null
-  }, [phraseSel, finalizePhrase, chapter, book, chapterIdx, onSelectWord])
+  }, [finalizePhrase, openWordAt])
+
+  const handlePointerCancel = useCallback(() => {
+    if (longPressTimerRef.current) {
+      clearTimeout(longPressTimerRef.current)
+      longPressTimerRef.current = null
+    }
+    pointerStartRef.current = null
+    // If we were selecting a phrase, keep what we have instead of wiping it
+    if (phraseSelRef.current) {
+      finalizePhrase()
+    }
+  }, [finalizePhrase])
 
   const goToChapter = useCallback((newIdx) => {
     if (newIdx < 0 || newIdx >= book.chapters.length) return
-    // Stop TTS
-    if (typeof window !== 'undefined' && window.speechSynthesis) window.speechSynthesis.cancel()
-    setReadingAloud(false)
-    setSpeakingWord(null)
+    narratorRef.current?.stop()
     setChapterIdx(newIdx)
     if (scrollRef.current) scrollRef.current.scrollTop = 0
     onUpdateProgress({ chapter: newIdx, scroll: 0, percent: 0 })
@@ -1738,7 +1942,6 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
       rafId = null
       const total = el.scrollHeight - el.clientHeight
       const pct = total > 0 ? Math.min(100, (el.scrollTop / total) * 100) : 0
-      // Directly mutate DOM — no React re-render, no CSS transition
       if (barRef.current) barRef.current.style.width = pct + '%'
       const rounded = Math.round(pct)
       if (rounded !== lastPct && percentTextRef.current) {
@@ -1749,7 +1952,6 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
 
     const onScroll = () => {
       if (rafId == null) rafId = requestAnimationFrame(paint)
-      // Debounce persistent save separately
       clearTimeout(timer)
       timer = setTimeout(() => {
         const total = el.scrollHeight - el.clientHeight
@@ -1759,9 +1961,7 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
     }
 
     el.addEventListener('scroll', onScroll, { passive: true })
-    // Paint initial state (after mount)
     requestAnimationFrame(paint)
-
     return () => {
       el.removeEventListener('scroll', onScroll)
       clearTimeout(timer)
@@ -1769,62 +1969,113 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
     }
   }, [chapterIdx, onUpdateProgress])
 
-  const startReadAloud = useCallback(() => {
-    if (typeof window === 'undefined' || !window.speechSynthesis) return
-    window.speechSynthesis.cancel()
-
-    const allWords = []
-    chapter.paragraphs.forEach((item, pIdx) => {
-      const para = typeof item === 'string' ? item : (item.content || '')
-      if (!para) return
-      const tokens = tokenize(para)
-      let wIdx = 0
-      tokens.forEach(t => {
-        if (t.type === 'word') {
-          allWords.push({ paraIdx: pIdx, wordIdx: wIdx })
-          wIdx++
+  // Narrator lifecycle — only recreate when the book changes.
+  // Do NOT depend on onUpdateProgress identity: closing the def panel re-renders App,
+  // which was destroying the narrator mid–ElevenLabs fetch (Read from here broke).
+  useEffect(() => {
+    clearElevenLabsDisabled()
+    const warnedFallback = { current: false }
+    let lastProvider = null
+    const narrator = createNarrator({
+      book,
+      initialRate: voiceRate,
+      onStatus: (s) => {
+        setPlayer(s)
+        if (
+          s.playing &&
+          lastProvider === 'eleven' &&
+          s.provider === 'webspeech' &&
+          !warnedFallback.current
+        ) {
+          warnedFallback.current = true
+          toast.message('ElevenLabs hiccup — continuing with device voice')
         }
-      })
-    })
-
-    setReadingAloud(true)
-    const fullText = chapter.paragraphs.map(item => typeof item === 'string' ? item : (item.content || '')).join('\n\n')
-    const utter = new SpeechSynthesisUtterance(fullText)
-    utter.rate = 0.9
-    utter.pitch = 1.0
-    utter.lang = 'en-US'
-
-    const voices = window.speechSynthesis.getVoices()
-    const preferred = voices.find(v => /Samantha|Karen|Google US English|Microsoft Aria/i.test(v.name)) || voices.find(v => v.lang?.startsWith('en'))
-    if (preferred) utter.voice = preferred
-
-    let wordCount = 0
-    utter.onboundary = (e) => {
-      if (e.name === 'word' && allWords[wordCount]) {
-        setSpeakingWord({ paraIdx: allWords[wordCount].paraIdx, wordIdx: allWords[wordCount].wordIdx })
-        const el = document.querySelector(`[data-p="${allWords[wordCount].paraIdx}"][data-w="${allWords[wordCount].wordIdx}"]`)
-        if (el && scrollRef.current) {
-          const rect = el.getBoundingClientRect()
-          const containerRect = scrollRef.current.getBoundingClientRect()
-          if (rect.top < containerRect.top + 100 || rect.bottom > containerRect.bottom - 100) {
-            el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+        lastProvider = s.provider
+      },
+      onSpeakingWord: (w) => {
+        if (!w) {
+          setSpeakingWord(null)
+          return
+        }
+        setSpeakingWord({ paraIdx: w.paraIdx, wordIdx: w.wordIdx, chapterIdx: w.chapterIdx })
+        if (w.chapterIdx !== chapterIdxRef.current) {
+          setChapterIdx(w.chapterIdx)
+          onUpdateProgressRef.current?.({ chapter: w.chapterIdx })
+        }
+        requestAnimationFrame(() => {
+          if (w.chapterIdx !== chapterIdxRef.current) return
+          const el = document.querySelector(`[data-p="${w.paraIdx}"][data-w="${w.wordIdx}"]`)
+          if (el && scrollRef.current) {
+            const rect = el.getBoundingClientRect()
+            const containerRect = scrollRef.current.getBoundingClientRect()
+            if (rect.top < containerRect.top + 100 || rect.bottom > containerRect.bottom - 120) {
+              el.scrollIntoView({ behavior: 'smooth', block: 'center' })
+            }
           }
+        })
+      },
+      onChapterNeeded: (idx) => {
+        if (idx !== chapterIdxRef.current) {
+          setChapterIdx(idx)
+          onUpdateProgressRef.current?.({ chapter: idx })
         }
-        wordCount++
+      },
+    })
+    narratorRef.current = narrator
+    if (narrateApiRef) {
+      narrateApiRef.current = {
+        playFromPosition: (c, p, w) => {
+          try {
+            window.speechSynthesis?.resume?.()
+            const warm = new Audio()
+            warm.src = 'data:audio/wav;base64,UklGRiQAAABXQVZFZm10IBAAAAABAAEAESsAACJWAAACABAAZGF0YQAAAAA='
+            warm.play().then(() => { warm.pause(); warm.src = '' }).catch(() => {})
+          } catch {}
+          if (!narratorRef.current) return false
+          narrator.playFromPosition(c, p, w)
+          return true
+        },
       }
     }
-    utter.onend = () => { setReadingAloud(false); setSpeakingWord(null) }
-    utter.onerror = () => { setReadingAloud(false); setSpeakingWord(null) }
-    window.speechSynthesis.speak(utter)
-  }, [chapter])
+    return () => {
+      narrator.destroy()
+      narratorRef.current = null
+      if (narrateApiRef) narrateApiRef.current = null
+    }
+  }, [book.id]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  const stopReadAloud = () => {
-    if (typeof window !== 'undefined' && window.speechSynthesis) window.speechSynthesis.cancel()
-    setReadingAloud(false)
+  // Keep narrator rate in sync when user changes speed
+  useEffect(() => {
+    narratorRef.current?.setRate?.(voiceRate)
+  }, [voiceRate])
+
+  useEffect(() => {
+    if (!narrateRequest || !narratorRef.current) return
+    const { chapterIdx: c, paraIdx, wordIdx } = narrateRequest
+    if (typeof c === 'number' && c !== chapterIdx) {
+      setChapterIdx(c)
+      onUpdateProgress({ chapter: c, scroll: 0 })
+    }
+    narratorRef.current.playFromPosition(c ?? chapterIdx, paraIdx ?? 0, wordIdx ?? 0)
+    onNarrateRequestHandled?.()
+  }, [narrateRequest]) // eslint-disable-line
+
+  const startReadAloud = useCallback(() => {
+    if (player.playing && player.paused) {
+      narratorRef.current?.resume()
+      return
+    }
+    if (player.playing && !player.paused) {
+      narratorRef.current?.pause()
+      return
+    }
+    narratorRef.current?.playFromChapterStart(chapterIdx)
+  }, [player.playing, player.paused, chapterIdx])
+
+  const stopReadAloud = useCallback(() => {
+    narratorRef.current?.stop()
     setSpeakingWord(null)
-  }
-
-  useEffect(() => () => { if (typeof window !== 'undefined' && window.speechSynthesis) window.speechSynthesis.cancel() }, [])
+  }, [])
 
   const initialPercent = progress?.percent || 0
 
@@ -1834,12 +2085,18 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
     saveLS(STORAGE_KEYS.SETTINGS, { ...loadLS(STORAGE_KEYS.SETTINGS, {}), fontSize: s })
   }
 
+  const changeVoiceRate = (r) => {
+    setVoiceRate(r)
+    saveLS(STORAGE_KEYS.SETTINGS, { ...loadLS(STORAGE_KEYS.SETTINGS, {}), voiceRate: r })
+    narratorRef.current?.setRate?.(r)
+  }
+
   return (
     <div className="fixed inset-0 bg-background flex flex-col">
       <header className="safe-top px-4 pb-3 pt-4 border-b border-border/40 bg-background/95 backdrop-blur-md z-20">
-        <div className="flex items-center justify-between gap-3">
-          <Button variant="ghost" size="icon" onClick={onClose} className="rounded-full h-10 w-10 -ml-1 hover:bg-primary/15">
-            <ArrowLeft className="w-5 h-5 text-secondary" />
+        <div className="flex items-center justify-between gap-2">
+          <Button variant="ghost" size="icon" onClick={onClose} className="rounded-full h-12 w-12 -ml-1 hover:bg-primary/15">
+            <ArrowLeft className="w-6 h-6 text-secondary" />
           </Button>
           <div className="flex-1 text-center overflow-hidden">
             <div className="font-serif-cozy text-sm font-semibold text-foreground truncate flex items-center justify-center gap-1.5">
@@ -1852,26 +2109,31 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
                 : chapterLabel(chapter, 0)} · <span ref={percentTextRef}>{initialPercent}% complete</span>
             </div>
           </div>
-          <div className="flex items-center gap-1">
+          <div className="flex items-center gap-0.5">
             {hasMultipleChapters && (
-              <Button variant="ghost" size="icon" onClick={() => setTocOpen(true)} className="rounded-full h-10 w-10 hover:bg-primary/15" aria-label="Table of contents">
-                <List className="w-5 h-5 text-secondary" />
+              <Button variant="ghost" size="icon" onClick={() => setTocOpen(true)} className="rounded-full h-12 w-12 hover:bg-primary/15" aria-label="Table of contents">
+                <List className="w-6 h-6 text-secondary" />
               </Button>
             )}
-            <Button variant="ghost" size="icon" onClick={() => changeFontSize(-1)} className="rounded-full h-10 w-10 hover:bg-primary/15" aria-label="Smaller text" disabled={fontSize <= 15}>
+            <Button variant="ghost" size="icon" onClick={() => changeFontSize(-1)} className="rounded-full h-12 w-12 hover:bg-primary/15" aria-label="Smaller text" disabled={fontSize <= 15}>
               <span className="text-secondary font-serif-cozy text-[15px] font-semibold leading-none">A−</span>
             </Button>
-            <Button variant="ghost" size="icon" onClick={() => changeFontSize(1)} className="rounded-full h-10 w-10 hover:bg-primary/15" aria-label="Bigger text" disabled={fontSize >= 28}>
+            <Button variant="ghost" size="icon" onClick={() => changeFontSize(1)} className="rounded-full h-12 w-12 hover:bg-primary/15" aria-label="Bigger text" disabled={fontSize >= 28}>
               <span className="text-secondary font-serif-cozy text-[19px] font-semibold leading-none">A+</span>
             </Button>
             <Button
-              variant={readingAloud ? 'default' : 'ghost'}
+              variant={readingAloud || preparingVoice ? 'default' : 'ghost'}
               size="icon"
-              onClick={readingAloud ? stopReadAloud : startReadAloud}
-              className={`rounded-full h-10 w-10 ${readingAloud ? 'bg-primary text-primary-foreground hover:bg-primary/90' : 'hover:bg-primary/15'}`}
-              aria-label={readingAloud ? 'Stop reading' : 'Read aloud'}
+              onClick={startReadAloud}
+              disabled={preparingVoice}
+              className={`rounded-full h-12 w-12 ${readingAloud || preparingVoice ? 'bg-primary text-primary-foreground hover:bg-primary/90' : 'hover:bg-primary/15'}`}
+              aria-label={preparingVoice ? 'Preparing voice' : readingAloud ? 'Pause reading' : 'Read aloud'}
             >
-              {readingAloud ? <Pause className="w-5 h-5" /> : <Play className="w-5 h-5 text-secondary" />}
+              {preparingVoice
+                ? <Loader2 className="w-6 h-6 animate-spin" />
+                : readingAloud
+                  ? <Pause className="w-6 h-6" />
+                  : <Play className="w-6 h-6 text-secondary" />}
             </Button>
           </div>
         </div>
@@ -1880,13 +2142,14 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
         </div>
       </header>
 
-      <div ref={scrollRef} className="flex-1 overflow-y-auto safe-bottom">
+      <div ref={scrollRef} className="flex-1 overflow-y-auto">
         <article
-          className="max-w-2xl mx-auto px-6 py-8 pb-32 select-none"
+          ref={articleRef}
+          className={`max-w-2xl mx-auto px-6 py-8 select-none ${playerVisible ? 'pb-56' : 'pb-32'} ${selecting ? 'is-phrase-selecting' : ''}`}
           onPointerDown={handlePointerDown}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
-          onPointerCancel={cancelSelection}
+          onPointerCancel={handlePointerCancel}
         >
           <header className="mb-8 text-center">
             <div className="text-[11px] uppercase tracking-widest text-muted-foreground/80">{book.author}</div>
@@ -1909,7 +2172,6 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
                 )
               }
               if (item.type === 'heading') {
-                // Skip duplicate chapter title heading at the start of the chapter body
                 if (pIdx === 0 && cleanHeadingMatch(item.content, chapter.title)) return null
                 return (
                   <h3 key={pIdx} className="font-serif-cozy text-xl font-semibold text-center mt-8 mb-4">
@@ -1922,10 +2184,14 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
                   key={pIdx}
                   text={item.content || ''}
                   paraIdx={pIdx}
-                  speakingWord={speakingWord}
+                  speakingWord={speakingWord?.chapterIdx === chapterIdx ? speakingWord : null}
                   bookmarkedWords={bookmarkedWords}
-                  range={normalizedRange}
-                  selecting={!!phraseSel}
+                  selecting={selecting}
+                  onWordClick={(wIdx) => {
+                    if (suppressClickRef.current) return
+                    if (selecting) return
+                    openWordAt(pIdx, wIdx)
+                  }}
                 />
               )
             })}
@@ -1946,14 +2212,14 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
                   size="sm"
                   onClick={() => goToChapter(chapterIdx - 1)}
                   disabled={chapterIdx === 0}
-                  className="rounded-full border-primary/40 hover:bg-primary/10"
+                  className="rounded-full h-12 px-4 border-primary/40 hover:bg-primary/10"
                 >
-                  <ChevronLeft className="w-4 h-4 mr-1" /> Previous
+                  <ChevronLeft className="w-5 h-5 mr-1" /> Previous
                 </Button>
                 <button
                   type="button"
                   onClick={() => setTocOpen(true)}
-                  className="text-xs text-muted-foreground/80 font-serif-cozy px-2 py-1 rounded-full hover:bg-primary/10"
+                  className="text-xs text-muted-foreground/80 font-serif-cozy min-h-[44px] px-3 py-2 rounded-full hover:bg-primary/10"
                 >
                   {chapterIdx + 1} / {book.chapters.length}
                 </button>
@@ -1962,15 +2228,128 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
                   size="sm"
                   onClick={() => goToChapter(chapterIdx + 1)}
                   disabled={chapterIdx >= book.chapters.length - 1}
-                  className="rounded-full border-primary/40 hover:bg-primary/10"
+                  className="rounded-full h-12 px-4 border-primary/40 hover:bg-primary/10"
                 >
-                  Next <ChevronRight className="w-4 h-4 ml-1" />
+                  Next <ChevronRight className="w-5 h-5 ml-1" />
                 </Button>
               </div>
             )}
           </footer>
         </article>
       </div>
+
+      {/* Sticky next-chapter control */}
+      {hasMultipleChapters && chapterIdx < book.chapters.length - 1 && (
+        <Button
+          type="button"
+          onClick={() => goToChapter(chapterIdx + 1)}
+          className={`fixed right-4 z-30 h-14 rounded-full px-4 shadow-lg bg-primary text-primary-foreground hover:bg-primary/90 gap-1.5 ${
+            playerVisible ? 'bottom-48' : 'bottom-6'
+          }`}
+          style={{ marginBottom: 'env(safe-area-inset-bottom, 0px)' }}
+          aria-label="Next chapter"
+        >
+          <span className="font-medium text-sm">Next chapter</span>
+          <ChevronRight className="w-5 h-5" />
+        </Button>
+      )}
+
+      <AnimatePresence>
+        {playerVisible && (
+          <motion.div
+            initial={{ y: '110%' }}
+            animate={{ y: 0 }}
+            exit={{ y: '110%' }}
+            transition={{ type: 'spring', stiffness: 320, damping: 32 }}
+            className="fixed bottom-0 left-0 right-0 z-40 safe-bottom"
+          >
+            <div className="mx-auto max-w-md m-3 rounded-3xl border border-border/50 bg-background/95 backdrop-blur-md shadow-lg px-3 py-3">
+              <div className="text-center text-[11px] text-muted-foreground mb-2 font-medium tabular-nums">
+                {preparingVoice ? (
+                  <span className="inline-flex items-center gap-1.5">
+                    <Loader2 className="w-3.5 h-3.5 animate-spin" />
+                    Preparing voice…
+                  </span>
+                ) : (
+                  <>
+                    Word {Math.min(player.wordIndex + 1, player.totalWords || 1)} of {player.totalWords || 0}
+                    <span className="opacity-60 ml-2">· {player.provider === 'eleven' ? 'ElevenLabs' : 'Device voice'}</span>
+                  </>
+                )}
+              </div>
+              <div className="flex items-center justify-center gap-3">
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-14 w-14 rounded-full hover:bg-primary/15 text-sm font-semibold text-secondary"
+                  aria-label="Skip back 10 words"
+                  disabled={preparingVoice}
+                  onClick={() => narratorRef.current?.seekByWords(-10)}
+                >
+                  −10
+                </Button>
+                <Button
+                  size="icon"
+                  className="h-16 w-16 rounded-full bg-primary text-primary-foreground hover:bg-primary/90 shadow-md"
+                  aria-label={preparingVoice ? 'Preparing voice' : readingAloud ? 'Pause' : 'Play'}
+                  disabled={preparingVoice}
+                  onClick={() => {
+                    if (!player.playing) narratorRef.current?.playFromChapterStart(chapterIdx)
+                    else if (player.paused) narratorRef.current?.resume()
+                    else narratorRef.current?.pause()
+                  }}
+                >
+                  {preparingVoice
+                    ? <Loader2 className="w-7 h-7 animate-spin" />
+                    : readingAloud
+                      ? <Pause className="w-7 h-7" />
+                      : <Play className="w-7 h-7 ml-0.5" />}
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-14 w-14 rounded-full hover:bg-primary/15 text-sm font-semibold text-secondary"
+                  aria-label="Skip forward 10 words"
+                  disabled={preparingVoice}
+                  onClick={() => narratorRef.current?.seekByWords(10)}
+                >
+                  +10
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="icon"
+                  className="h-14 w-14 rounded-full hover:bg-destructive/15"
+                  aria-label="Stop"
+                  onClick={stopReadAloud}
+                >
+                  <Square className="w-5 h-5 text-secondary fill-current" />
+                </Button>
+              </div>
+              <div className="mt-3 flex items-center justify-center gap-1 overflow-x-auto px-1 pb-0.5">
+                {SPEED_OPTIONS.map((r) => {
+                  const active = (player.rate || voiceRate) === r
+                  return (
+                    <button
+                      key={r}
+                      type="button"
+                      onClick={() => changeVoiceRate(r)}
+                      className={`min-h-[44px] min-w-[44px] px-2 rounded-full text-[12px] font-semibold tabular-nums transition-colors ${
+                        active
+                          ? 'bg-primary text-primary-foreground'
+                          : 'text-secondary hover:bg-primary/15'
+                      }`}
+                      aria-label={`Speed ${r}x`}
+                      aria-pressed={active}
+                    >
+                      {r === 1 ? '1x' : `${r}x`}
+                    </button>
+                  )
+                })}
+              </div>
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       <Sheet open={tocOpen} onOpenChange={setTocOpen}>
         <SheetContent side="left" className="w-[min(100%,22rem)] p-0 flex flex-col">
@@ -1987,7 +2366,7 @@ function ReaderView({ book, progress, onUpdateProgress, onClose, onSelectWord, b
                   goToChapter(idx)
                   setTocOpen(false)
                 }}
-                className={`w-full text-left px-3 py-2.5 rounded-xl transition-colors ${
+                className={`w-full text-left px-3 py-3 min-h-[48px] rounded-xl transition-colors ${
                   idx === chapterIdx ? 'bg-primary/15 text-foreground' : 'hover:bg-muted/60 text-foreground/85'
                 }`}
               >
@@ -2013,47 +2392,54 @@ function cleanTextLike(t) {
   return (t || '').replace(/\s+/g, ' ').replace(/\u00a0/g, ' ').trim()
 }
 
-function Paragraph({ text, paraIdx, speakingWord, bookmarkedWords, range, selecting }) {
+function Paragraph({ text, paraIdx, speakingWord, bookmarkedWords, selecting, onWordClick }) {
   const tokens = useMemo(() => tokenize(text), [text])
-
-  const isInRange = (wIdx) => {
-    if (!range) return false
-    const { pMin, wMin, pMax, wMax } = range
-    if (paraIdx < pMin || paraIdx > pMax) return false
-    if (paraIdx === pMin && paraIdx === pMax) return wIdx >= wMin && wIdx <= wMax
-    if (paraIdx === pMin) return wIdx >= wMin
-    if (paraIdx === pMax) return wIdx <= wMax
-    return true
-  }
 
   let wIdx = -1
   return (
     <p className="text-foreground/90">
       {tokens.map((t, i) => {
         if (t.type === 'space') {
-          // If between two selected words, highlight the space too for continuity
           const prev = tokens[i - 1]
           const next = tokens[i + 1]
-          const spaceInRange = selecting && prev?.type === 'word' && next?.type === 'word' &&
-            isInRange(wIdx) && isInRange(wIdx + 1)
-          return (
-            <span key={i} className={spaceInRange ? 'phrase-selected' : undefined}>
-              {t.text}
-            </span>
-          )
+          if (prev?.type === 'word' && next?.type === 'word') {
+            return (
+              <span
+                key={i}
+                data-phrase-space=""
+                data-p={paraIdx}
+                data-w-before={wIdx}
+              >
+                {t.text}
+              </span>
+            )
+          }
+          return <span key={i}>{t.text}</span>
         }
         wIdx++
         const currentWIdx = wIdx
         const isSpeaking = speakingWord?.paraIdx === paraIdx && speakingWord?.wordIdx === currentWIdx
         const isBookmarked = bookmarkedWords.has(t.text.toLowerCase())
-        const inRange = isInRange(currentWIdx)
         return (
           <span
             key={i}
+            role="button"
+            tabIndex={0}
             data-p={paraIdx}
             data-w={currentWIdx}
-            className={`word ${isSpeaking ? 'word-speaking' : ''} ${inRange ? 'phrase-selected' : ''} ${isBookmarked ? 'font-medium' : ''}`}
-            style={isBookmarked && !inRange ? { textDecoration: 'underline', textDecorationColor: 'hsl(28 51% 65% / 0.55)', textDecorationThickness: '2px', textUnderlineOffset: '3px' } : undefined}
+            className={`word ${isSpeaking ? 'word-speaking' : ''} ${isBookmarked ? 'font-medium' : ''}`}
+            style={isBookmarked ? { textDecoration: 'underline', textDecorationColor: 'hsl(28 51% 65% / 0.55)', textDecorationThickness: '2px', textUnderlineOffset: '3px' } : undefined}
+            onClick={(e) => {
+              if (selecting) return
+              e.stopPropagation()
+              onWordClick?.(currentWIdx)
+            }}
+            onKeyDown={(e) => {
+              if (e.key === 'Enter' || e.key === ' ') {
+                e.preventDefault()
+                onWordClick?.(currentWIdx)
+              }
+            }}
           >
             {t.text}
           </span>
@@ -2066,11 +2452,12 @@ function Paragraph({ text, paraIdx, speakingWord, bookmarkedWords, range, select
 // ============================================================
 // DEFINITION PANEL
 // ============================================================
-function DefinitionPanel({ selection, onClose, cache, onCache, onBookmark, bookmarks }) {
+function DefinitionPanel({ selection, onClose, cache, onCache, onBookmark, bookmarks, onReadFromHere }) {
   const [loading, setLoading] = useState(false)
   const [def, setDef] = useState(null)
   const [error, setError] = useState(null)
   const [loadingMore, setLoadingMore] = useState(false)
+  const [startingRead, setStartingRead] = useState(false)
 
   const word = selection?.word
   const wordLower = word?.toLowerCase()
@@ -2079,7 +2466,7 @@ function DefinitionPanel({ selection, onClose, cache, onCache, onBookmark, bookm
   const isBookmarked = !!bookmarks.find(b => b.word === wordLower && b.bookId === selection?.bookId)
 
   useEffect(() => {
-    if (!selection) { setDef(null); setError(null); return }
+    if (!selection) { setDef(null); setError(null); setStartingRead(false); return }
 
     if (cache[cacheKey]) {
       setDef(cache[cacheKey])
@@ -2112,14 +2499,13 @@ function DefinitionPanel({ selection, onClose, cache, onCache, onBookmark, bookm
       .finally(() => setLoading(false))
   }, [selection]) // eslint-disable-line
 
-  const speak = useCallback((text) => {
-    if (typeof window === 'undefined' || !window.speechSynthesis) return
+  const speak = useCallback(async (text) => {
+    if (typeof window === 'undefined' || !window.speechSynthesis || !text) return
     window.speechSynthesis.cancel()
     const u = new SpeechSynthesisUtterance(text)
     u.rate = 0.85
     u.lang = 'en-US'
-    const voices = window.speechSynthesis.getVoices()
-    const v = voices.find(vc => /Samantha|Karen|Google US English|Microsoft Aria/i.test(vc.name)) || voices.find(vc => vc.lang?.startsWith('en'))
+    const v = await pickFallbackVoice()
     if (v) u.voice = v
     window.speechSynthesis.speak(u)
   }, [])
@@ -2183,42 +2569,65 @@ function DefinitionPanel({ selection, onClose, cache, onCache, onBookmark, bookm
               <div className="w-11 h-1.5 rounded-full bg-muted-foreground/30" />
             </div>
 
-            <div className="px-6 pt-3 pb-2 flex items-start justify-between gap-3">
-              <div className="flex-1 min-w-0">
-                <div className="flex items-start gap-2 flex-wrap">
+            <div className="px-6 pt-3 pb-3">
+              <div className="flex items-start justify-between gap-3">
+                <div className="flex-1 min-w-0">
                   <h3 className={`font-serif-cozy font-semibold leading-tight ${isPhraseMode ? 'text-xl' : 'text-3xl capitalize'}`}>
                     {isPhraseMode ? `“${displayText}”` : displayText}
                   </h3>
+                  {def && (
+                    <div className="text-sm text-muted-foreground mt-1 flex items-center gap-2 flex-wrap">
+                      {def.phonetic && <span className="font-mono">{def.phonetic}</span>}
+                      {typeLabel && <span className="italic">{def.phonetic ? '· ' : ''}{typeLabel}</span>}
+                    </div>
+                  )}
+                </div>
+                <div className="flex items-center gap-1 flex-shrink-0">
                   <Button
                     variant="ghost" size="icon"
-                    className="h-10 w-10 rounded-full hover:bg-primary/20 flex-shrink-0 -mt-0.5"
-                    onClick={() => speak(displayText)}
-                    aria-label={isPhraseMode ? 'Read phrase' : 'Pronounce word'}
+                    className="h-12 w-12 rounded-full hover:bg-primary/20"
+                    onClick={handleBookmark}
+                    disabled={!def}
+                    aria-label="Save bookmark"
                   >
-                    <Volume2 className="w-5 h-5 text-secondary" />
+                    {isBookmarked
+                      ? <BookmarkCheck className="w-6 h-6 text-secondary fill-secondary/30" />
+                      : <Bookmark className="w-6 h-6 text-secondary" />}
+                  </Button>
+                  <Button variant="ghost" size="icon" onClick={onClose} className="h-12 w-12 rounded-full hover:bg-primary/20" aria-label="Close">
+                    <X className="w-6 h-6 text-secondary" />
                   </Button>
                 </div>
-                {def && (
-                  <div className="text-sm text-muted-foreground mt-1 flex items-center gap-2 flex-wrap">
-                    {def.phonetic && <span className="font-mono">{def.phonetic}</span>}
-                    {typeLabel && <span className="italic">{def.phonetic ? '· ' : ''}{typeLabel}</span>}
-                  </div>
-                )}
               </div>
-              <div className="flex items-center gap-1 flex-shrink-0">
+
+              {/* Always-visible listen / continue-reading actions */}
+              <div className="mt-3 flex gap-2">
                 <Button
-                  variant="ghost" size="icon"
-                  className="h-10 w-10 rounded-full hover:bg-primary/20"
-                  onClick={handleBookmark}
-                  disabled={!def}
-                  aria-label="Save bookmark"
+                  type="button"
+                  variant="outline"
+                  className="flex-1 h-14 rounded-2xl border-primary/40 hover:bg-primary/10 gap-2"
+                  onClick={() => speak(displayText)}
+                  aria-label={isPhraseMode ? 'Hear phrase' : 'Hear word'}
                 >
-                  {isBookmarked
-                    ? <BookmarkCheck className="w-5 h-5 text-secondary fill-secondary/30" />
-                    : <Bookmark className="w-5 h-5 text-secondary" />}
+                  <Ear className="w-6 h-6 text-secondary" />
+                  <span className="font-medium">Hear word</span>
                 </Button>
-                <Button variant="ghost" size="icon" onClick={onClose} className="h-10 w-10 rounded-full hover:bg-primary/20" aria-label="Close">
-                  <X className="w-5 h-5 text-secondary" />
+                <Button
+                  type="button"
+                  className="flex-1 h-14 rounded-2xl gap-2 bg-primary text-primary-foreground hover:bg-primary/90"
+                  disabled={startingRead}
+                  onClick={() => {
+                    setStartingRead(true)
+                    onReadFromHere?.(selection)
+                  }}
+                  aria-label="Read from here"
+                >
+                  {startingRead ? (
+                    <Loader2 className="w-6 h-6 animate-spin" />
+                  ) : (
+                    <Play className="w-6 h-6" />
+                  )}
+                  <span className="font-medium">{startingRead ? 'Starting…' : 'Read from here'}</span>
                 </Button>
               </div>
             </div>
@@ -2268,7 +2677,7 @@ function DefinitionPanel({ selection, onClose, cache, onCache, onBookmark, bookm
                       size="sm"
                       onClick={loadMoreExamples}
                       disabled={loadingMore}
-                      className="mt-3 w-full rounded-full border-primary/40 hover:bg-primary/10 text-foreground/80"
+                      className="mt-3 w-full h-12 rounded-full border-primary/40 hover:bg-primary/10 text-foreground/80"
                     >
                       {loadingMore ? <Loader2 className="w-3.5 h-3.5 animate-spin mr-1.5" /> : <Plus className="w-3.5 h-3.5 mr-1.5" />}
                       Show more examples
@@ -2290,7 +2699,7 @@ function ExampleRow({ text, onPlay }) {
       <Button
         variant="ghost" size="icon"
         onClick={onPlay}
-        className="h-10 w-10 rounded-full hover:bg-primary/20 flex-shrink-0 mt-0.5"
+        className="h-12 w-12 rounded-full hover:bg-primary/20 flex-shrink-0 mt-0.5"
         aria-label="Play example"
       >
         <Volume2 className="w-5 h-5 text-secondary" />
@@ -2308,7 +2717,7 @@ function BookmarksView({ bookmarks, onBack, onRemove, onOpenBook }) {
     <div className="min-h-screen">
       <header className="safe-top px-4 pb-4 pt-6 sticky top-0 z-30 backdrop-blur-md bg-background/85 border-b border-border/40">
         <div className="max-w-4xl mx-auto flex items-center gap-3">
-          <Button variant="ghost" size="icon" onClick={onBack} className="rounded-full h-10 w-10 hover:bg-primary/15">
+          <Button variant="ghost" size="icon" onClick={onBack} className="rounded-full h-12 w-12 hover:bg-primary/15">
             <ArrowLeft className="w-5 h-5 text-secondary" />
           </Button>
           <div>
@@ -2340,11 +2749,13 @@ function BookmarksView({ bookmarks, onBack, onRemove, onOpenBook }) {
 }
 
 function BookmarkCard({ bookmark, onRemove, onOpen }) {
-  const speak = () => {
+  const speak = async () => {
     if (typeof window === 'undefined' || !window.speechSynthesis) return
     window.speechSynthesis.cancel()
     const u = new SpeechSynthesisUtterance(bookmark.word)
     u.rate = 0.85; u.lang = 'en-US'
+    const v = await pickFallbackVoice()
+    if (v) u.voice = v
     window.speechSynthesis.speak(u)
   }
   const date = new Date(bookmark.createdAt).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' })
@@ -2357,8 +2768,8 @@ function BookmarkCard({ bookmark, onRemove, onOpen }) {
             <h3 className={`font-serif-cozy font-semibold leading-tight ${isPhrase ? 'text-lg' : 'text-2xl capitalize'}`}>
               {isPhrase ? `“${bookmark.word}”` : bookmark.word}
             </h3>
-            <Button variant="ghost" size="icon" onClick={speak} className="h-10 w-10 rounded-full hover:bg-primary/15 flex-shrink-0 mt-0.5">
-              <Volume2 className="w-5 h-5 text-secondary" />
+            <Button variant="ghost" size="icon" onClick={speak} className="h-12 w-12 rounded-full hover:bg-primary/15 flex-shrink-0 mt-0.5">
+              <Volume2 className="w-6 h-6 text-secondary" />
             </Button>
           </div>
           <div className="text-xs text-muted-foreground mt-1.5 flex items-center gap-2 flex-wrap">
@@ -2370,7 +2781,7 @@ function BookmarkCard({ bookmark, onRemove, onOpen }) {
             <p className="text-xs mt-1.5 text-muted-foreground italic leading-relaxed">Literally: {bookmark.literal}</p>
           )}
         </div>
-        <Button variant="ghost" size="icon" onClick={onRemove} className="h-10 w-10 rounded-full hover:bg-destructive/15 flex-shrink-0">
+        <Button variant="ghost" size="icon" onClick={onRemove} className="h-12 w-12 rounded-full hover:bg-destructive/15 flex-shrink-0">
           <X className="w-5 h-5 text-muted-foreground" />
         </Button>
       </div>

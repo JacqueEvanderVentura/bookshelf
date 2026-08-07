@@ -105,12 +105,25 @@
   border-radius: 4px;
 }
 
-/* Long-press phrase selection highlight */
+/* Long-press phrase selection highlight (data-attr survives React re-renders) */
+[data-phrase-on='1'] {
+  background-color: hsl(33 80% 72% / 0.55);
+  border-radius: 3px;
+  box-shadow: 0 0 0 1px hsl(28 51% 55% / 0.15);
+}
+
 .phrase-selected {
   background-color: hsl(33 80% 72% / 0.55);
   border-radius: 3px;
-  transition: background-color 0.08s ease;
   box-shadow: 0 0 0 1px hsl(28 51% 55% / 0.15);
+}
+
+.is-phrase-selecting {
+  user-select: none;
+  -webkit-user-select: none;
+}
+.is-phrase-selecting .word {
+  cursor: grabbing;
 }
 
 
@@ -126,12 +139,17 @@
 .safe-top { padding-top: max(env(safe-area-inset-top), 1rem); }
 .safe-bottom { padding-bottom: max(env(safe-area-inset-bottom), 1rem); }
 
-/* Prevent text selection during word tap */
+/* Prevent text selection during word tap; touch-action helps mobile taps */
 .reader-text .word {
   cursor: pointer;
-  padding: 0 1px;
+  padding: 2px 1px;
+  margin: -2px 0;
   border-radius: 3px;
   transition: background-color 0.15s;
+  touch-action: manipulation;
+  -webkit-tap-highlight-color: transparent;
+  -webkit-user-select: none;
+  user-select: none;
 }
 .reader-text .word:active {
   background-color: hsl(33 62% 82%);
