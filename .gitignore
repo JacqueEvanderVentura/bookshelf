@@ -21,6 +21,8 @@ node_modules/
 # Next.js
 /.next/
 /out/
+.next-export-skip/
+.export-skip/
 next-env.d.ts
 *.tsbuildinfo
 

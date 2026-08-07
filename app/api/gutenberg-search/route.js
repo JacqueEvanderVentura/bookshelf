@@ -6,6 +6,7 @@ export const runtime = 'nodejs'
 
 /**
  * Proxy Project Gutenberg's HTML catalog search (better relevance than Gutendex).
+ * Available in `next dev` / Node hosts; omitted from GitHub Pages static export.
  */
 export async function GET(request) {
   const q = (request.nextUrl.searchParams.get('q') || '').trim()

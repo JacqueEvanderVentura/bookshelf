@@ -8,6 +8,7 @@ const ALLOWED = /^https:\/\/([\w.-]+\.)?gutenberg\.org\//i
 /**
  * Same-origin EPUB proxy so the browser can download Gutenberg files
  * without hitting CORS (works in `next dev` / non-static deploys).
+ * Omitted from GitHub Pages static export — client uses CORS relays there.
  */
 export async function GET(request) {
   const url = request.nextUrl.searchParams.get('url')
@@ -32,7 +33,6 @@ export async function GET(request) {
     }
 
     const buf = await upstream.arrayBuffer()
-    // Sanity: EPUB is a zip (PK..)
     const head = new Uint8Array(buf.slice(0, 2))
     if (head[0] !== 0x50 || head[1] !== 0x4b) {
       return NextResponse.json({ error: 'Upstream did not return an EPUB' }, { status: 502 })
